@@ -43,6 +43,11 @@ pub enum Command {
     Resume,
     Print(PrintSelection),
     SetConfig(String),
+    /// Set `defaultStrategy` (or `strategyOnDischarging`) in the configuration file.
+    SetDefault {
+        strategy: String,
+        discharging: bool,
+    },
     // local-only extras
     Probe,
     TestFan {
@@ -94,6 +99,9 @@ commands:
   print [all|active|current|list|speed]
                       print the selected information (default: all)
   set_config <json>   replace the service configuration with the provided one
+  set-default <strategy> [--discharging]
+                      make a strategy the default (or the one used on battery) and save
+                      it in the configuration file (root only)
 
 local commands (need root, do not talk to the service):
   probe               print EC temperatures, fan speeds and AC state
@@ -103,11 +111,12 @@ local commands (need root, do not talk to the service):
   calibrate measure [--load-cmd CMD] [--output PATH]
                       measure fan and thermals once (~30-40 min, puts the CPU under
                       load) and save the data (default /etc/fw-fanctrl/calibration.json)
-  calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--dry-run]
-            [--config PATH] [--calibration PATH]
+  calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--default]
+            [--dry-run] [--config PATH] [--calibration PATH]
                       create a strategy from the saved data (default: balanced, named
                       calibrated-<preference>); --comfort-temp keeps the board (surface)
-                      at about C °C in idle; --dry-run only prints it
+                      at about C °C in idle; --default also makes it the default strategy;
+                      --dry-run only prints it
 ";
 
 struct Tokens<'a> {
@@ -219,6 +228,29 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
             Some(s) => Command::SetConfig(s.to_string()),
             None => bail!("the following arguments are required: provided_config"),
         },
+        "set-default" => {
+            let mut strategy = None;
+            let mut discharging = false;
+            while let Some(tok) = t.peek() {
+                if tok == "-h" || tok == "--help" {
+                    break;
+                }
+                t.next();
+                match tok {
+                    "--discharging" => discharging = true,
+                    _ if tok.starts_with('-') => bail!("unrecognized arguments: {tok}"),
+                    _ if strategy.is_none() => strategy = Some(tok.to_string()),
+                    _ => bail!("unrecognized arguments: {tok}"),
+                }
+            }
+            match strategy {
+                Some(strategy) => Command::SetDefault {
+                    strategy,
+                    discharging,
+                },
+                None => bail!("the following arguments are required: strategy"),
+            }
+        }
         "probe" if !remote => Command::Probe,
         "restore-auto" if !remote => Command::RestoreAuto,
         "test-fan" if !remote => parse_test_fan(&mut t)?,
@@ -304,6 +336,7 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
                 comfort_temp: None,
                 name: None,
                 dry_run: false,
+                set_default: false,
                 config: PathBuf::from(DEFAULT_CONFIG_PATH),
                 calibration: PathBuf::from(CALIBRATION_PATH),
             };
@@ -323,6 +356,7 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
                     }
                     "--name" => opts.name = Some(t.value(opt, inline)?.to_string()),
                     "--dry-run" => opts.dry_run = true,
+                    "--default" => opts.set_default = true,
                     "--config" | "-c" => opts.config = PathBuf::from(t.value(opt, inline)?),
                     "--calibration" => opts.calibration = PathBuf::from(t.value(opt, inline)?),
                     _ if opt.starts_with('-') => bail!("unrecognized arguments: {tok}"),
@@ -423,6 +457,17 @@ mod tests {
             OutputFormat::Json
         );
         assert_eq!(
+            p("set-default calibrated-quiet --discharging", true)
+                .unwrap()
+                .command,
+            Command::SetDefault {
+                strategy: "calibrated-quiet".into(),
+                discharging: true
+            }
+        );
+        assert!(p("set-default", true).is_err());
+        assert!(p("set-default a b", true).is_err());
+        assert_eq!(
             p(r#"set_config '{"a": 1}'"#, true).unwrap().command,
             Command::SetConfig(r#"{"a": 1}"#.into())
         );
@@ -462,7 +507,7 @@ mod tests {
         assert!(a.name.is_none() && !a.dry_run && a.comfort_temp.is_none());
 
         let Command::CalibrateApply(a) = p(
-            "calibrate apply quiet --comfort-temp 43 --name mac --dry-run",
+            "calibrate apply quiet --comfort-temp 43 --name mac --dry-run --default",
             false,
         )
         .unwrap()
@@ -473,7 +518,7 @@ mod tests {
         assert_eq!(a.prefer, Prefer::Quiet);
         assert_eq!(a.comfort_temp, Some(43.0));
         assert_eq!(a.name.as_deref(), Some("mac"));
-        assert!(a.dry_run);
+        assert!(a.dry_run && a.set_default);
 
         for bad in [
             "calibrate",

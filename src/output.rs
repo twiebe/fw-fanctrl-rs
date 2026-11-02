@@ -61,6 +61,12 @@ pub enum Reply {
         path: String,
         config: Value,
     },
+    SetDefault {
+        default_strategy: String,
+        strategy_on_discharging: String,
+        strategy: String,
+        default: bool,
+    },
     Status(Box<Status>),
 }
 
@@ -119,6 +125,15 @@ impl Reply {
             } => format!(
                 "Configuration updated with success: {}.{nl}Strategy in use: {strategy}{nl}Default: {}",
                 to_py_json(&json!({"path": path, "data": config})),
+                py_bool(*default)
+            ),
+            Reply::SetDefault {
+                default_strategy,
+                strategy_on_discharging,
+                strategy,
+                default,
+            } => format!(
+                "Default strategy: '{default_strategy}'{nl}Discharging strategy: '{strategy_on_discharging}'{nl}Strategy in use: '{strategy}'{nl}Default: {}",
                 py_bool(*default)
             ),
             Reply::Status(s) => {
@@ -180,6 +195,16 @@ impl Reply {
             // upstream sends the speed as a string here
             Reply::Speed(s) => json!({"status": ok, "speed": s.to_string()}),
             Reply::Active(a) => json!({"status": ok, "active": a}),
+            Reply::SetDefault {
+                default_strategy,
+                strategy_on_discharging,
+                strategy,
+                default,
+            } => json!({
+                "status": ok, "defaultStrategy": default_strategy,
+                "strategyOnDischarging": strategy_on_discharging,
+                "strategy": strategy, "default": default
+            }),
             Reply::SetConfig {
                 strategy,
                 default,

@@ -88,6 +88,8 @@ pub struct ApplyOptions {
     /// Strategy name; default `calibrated-<prefer>`.
     pub name: Option<String>,
     pub dry_run: bool,
+    /// Also make it the `defaultStrategy`.
+    pub set_default: bool,
     pub config: PathBuf,
     pub calibration: PathBuf,
 }
@@ -1367,7 +1369,12 @@ pub fn apply(opts: &ApplyOptions) -> Result<()> {
     let raw = fs::read_to_string(&opts.config)
         .map_err(|e| Error(format!("cannot read {}: {e}", opts.config.display())))?;
     let existed = Config::parse(&raw)?.strategy(&name).is_some();
-    let merged = merge_strategy(&raw, &name, &strategy)?;
+    let mut merged = merge_strategy(&raw, &name, &strategy)?;
+    if opts.set_default {
+        let mut data: Value = serde_json::from_str(&merged)?;
+        data["defaultStrategy"] = Value::String(name.clone());
+        merged = data.to_string();
+    }
     let backup = opts
         .config
         .with_extension(format!("json.bak-{}", now_secs()));
@@ -1379,10 +1386,17 @@ pub fn apply(opts: &ApplyOptions) -> Result<()> {
         opts.config.display(),
         backup.display()
     );
+    if opts.set_default {
+        eprintln!("'{name}' is now the default strategy");
+    }
     if daemon::send_command(&["reload".to_string()]).is_ok() {
         eprintln!("service reloaded");
     }
-    eprintln!("activate with: fw-fanctrl use {name}   (or set \"defaultStrategy\": \"{name}\")");
+    if !opts.set_default {
+        eprintln!(
+            "activate with: fw-fanctrl use {name}   (or make it the default: fw-fanctrl set-default {name})"
+        );
+    }
     Ok(())
 }
 
@@ -1740,6 +1754,7 @@ mod tests {
             comfort_temp: Some(43.0),
             name: None,
             dry_run,
+            set_default: false,
             config: config.clone(),
             calibration: calibration.clone(),
         };
@@ -1768,6 +1783,16 @@ mod tests {
             })
             .count();
         assert_eq!(backups, 1);
+        assert_eq!(c.default_strategy, "lazy");
+        apply(&ApplyOptions {
+            set_default: true,
+            ..opts(false)
+        })
+        .unwrap();
+        assert_eq!(
+            Config::load(&config).unwrap().default_strategy,
+            "calibrated-quiet"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

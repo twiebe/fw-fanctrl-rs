@@ -402,18 +402,9 @@ impl Service {
                     Ok(c) => c,
                     Err(e) => return Reply::Error(e.0),
                 };
-                if let Err(e) = config.save(&self.config_path) {
-                    return Reply::Error(format!("saving configuration failed: {e}"));
+                if let Err(e) = self.replace_config(config) {
+                    return Reply::Error(e.0);
                 }
-                self.config = config;
-                if self
-                    .overwritten
-                    .as_deref()
-                    .is_some_and(|n| self.config.strategy(n).is_none())
-                {
-                    self.overwritten = None;
-                }
-                self.controller.reset_timecount();
                 let (strategy, default) = current(self);
                 Reply::SetConfig {
                     strategy,
@@ -422,8 +413,51 @@ impl Service {
                     config: self.config.data.clone(),
                 }
             }
+            Command::SetDefault {
+                strategy,
+                discharging,
+            } => {
+                if self.config.strategy(strategy).is_none() {
+                    return Reply::Error(format!("The specified strategy is invalid: {strategy}"));
+                }
+                let key = if *discharging {
+                    "strategyOnDischarging"
+                } else {
+                    "defaultStrategy"
+                };
+                let mut data = self.config.data.clone();
+                data[key] = serde_json::Value::String(strategy.clone());
+                let result = Config::parse(&data.to_string()).and_then(|c| self.replace_config(c));
+                if let Err(e) = result {
+                    return Reply::Error(e.0);
+                }
+                let (current_strategy, default) = current(self);
+                Reply::SetDefault {
+                    default_strategy: self.config.default_strategy.clone(),
+                    strategy_on_discharging: self.config.strategy_on_discharging.clone(),
+                    strategy: current_strategy,
+                    default,
+                }
+            }
             other => Reply::Error(format!("command not supported by the service: {other:?}")),
         }
+    }
+
+    /// Save `config` to the config file and switch to it.
+    fn replace_config(&mut self, config: Config) -> Result<()> {
+        config
+            .save(&self.config_path)
+            .map_err(|e| format!("saving configuration failed: {e}"))?;
+        self.config = config;
+        if self
+            .overwritten
+            .as_deref()
+            .is_some_and(|n| self.config.strategy(n).is_none())
+        {
+            self.overwritten = None;
+        }
+        self.controller.reset_timecount();
+        Ok(())
     }
 
     pub fn shutdown(&mut self) {
@@ -526,8 +560,18 @@ pub fn answer(svc: &Mutex<Service>, request: &str, uid: Option<u32>) -> String {
         .and_then(|argv| cli::parse(&argv, true));
     match parsed {
         Ok(args) if args.command == Command::Help => cli::USAGE.to_string(),
-        Ok(args) if matches!(args.command, Command::SetConfig(_)) && uid != Some(0) => {
-            Reply::Error("set_config requires root".into()).render(args.output_format)
+        Ok(args)
+            if matches!(
+                args.command,
+                Command::SetConfig(_) | Command::SetDefault { .. }
+            ) && uid != Some(0) =>
+        {
+            let name = if matches!(args.command, Command::SetConfig(_)) {
+                "set_config"
+            } else {
+                "set-default"
+            };
+            Reply::Error(format!("{name} requires root")).render(args.output_format)
         }
         Ok(args) => lock(svc).handle(&args.command).render(args.output_format),
         Err(e) => {
@@ -948,6 +992,45 @@ mod tests {
         assert!(!f.svc.active);
         assert!(f.svc.pause_until.is_some());
         assert_eq!(f.log.lock().unwrap().last().unwrap(), "auto");
+    }
+
+    #[test]
+    fn set_default_saves_and_switches() {
+        let dir = std::env::temp_dir().join(format!("fwfan-default-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, include_str!("../tests/upstream_config.json")).unwrap();
+        let mut f = fixture(vec![Ok(40.0)], false, None);
+        f.svc.config_path = path.clone();
+        let s = Mutex::new(f.svc);
+        assert_eq!(
+            answer(&s, "set-default agile", Some(1000)),
+            "[Error] > An error occurred: set-default requires root"
+        );
+        assert!(
+            answer(&s, "set-default nope", Some(0)).contains("The specified strategy is invalid")
+        );
+        assert_eq!(
+            answer(&s, "set-default agile", Some(0)),
+            "Default strategy: 'agile'\nDischarging strategy: ''\nStrategy in use: 'agile'\nDefault: True"
+        );
+        assert_eq!(
+            answer(
+                &s,
+                "--output-format JSON set-default deaf --discharging",
+                Some(0)
+            ),
+            r#"{"status": "success", "defaultStrategy": "agile", "strategyOnDischarging": "deaf", "strategy": "agile", "default": true}"#
+        );
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(
+            (
+                saved.default_strategy.as_str(),
+                saved.strategy_on_discharging.as_str()
+            ),
+            ("agile", "deaf")
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

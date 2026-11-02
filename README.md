@@ -89,6 +89,16 @@ fw-fanctrl set_config '<json>'
 fw-fanctrl run [strategy] [--config PATH] [--silent]
 ```
 
+Added by fw-fanctrl-rs:
+
+```
+fw-fanctrl set-default <strategy> [--discharging]
+```
+
+`set-default` makes a strategy the `defaultStrategy` (with `--discharging`: the
+`strategyOnDischarging`). It saves the configuration file and the service switches at once.
+Like `set_config`, it is only accepted from root.
+
 `print all` additionally reports `TargetSpeed`, the fan RPM, the reading of every
 sensor and whether the fail-safe is active. `kill -HUP` (or `systemctl reload fw-fanctrl`) reloads the config.
 
@@ -113,7 +123,7 @@ Then **apply** the result as often as you like, which is instant.
 
 ```sh
 sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH]
-sudo fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--dry-run]
+sudo fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--default] [--dry-run]
 fw-fanctrl use calibrated-balanced
 ```
 
@@ -170,7 +180,8 @@ warm side. A running service is paused for the duration and resumed afterwards. 
 This turns the saved data into a strategy and adds it to the configuration as
 `calibrated-<preference>`, or as `--name`. The config is validated first, the previous file is
 kept as `config.json.bak-<timestamp>`, and a running service reloads it. `--dry-run` only
-prints the strategy. The output also says how old the measurement is.
+prints the strategy, and `--default` also makes it the `defaultStrategy`. The output also says
+how old the measurement is.
 
 The generated strategy is off until a few degrees above idle, rises gently to the anchor and
 reaches 100 % at the EC's own `fan_max` for the dominant sensor. It also gets `minSpeed`.
@@ -195,8 +206,8 @@ For example, all three side by side, with the quiet one on battery:
 
 ```sh
 for p in quiet balanced cool; do sudo fw-fanctrl calibrate apply $p --comfort-temp 43; done
-# then in /etc/fw-fanctrl/config.json:
-#   "defaultStrategy": "calibrated-balanced", "strategyOnDischarging": "calibrated-quiet"
+sudo fw-fanctrl set-default calibrated-balanced
+sudo fw-fanctrl set-default calibrated-quiet --discharging
 ```
 
 `--load-cmd` (for `measure`) runs an additional load next to the CPU load, e.g. a GPU benchmark
