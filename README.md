@@ -119,9 +119,17 @@ running service and resumes it afterwards. It goes through five phases:
    *Spiky* sensors (the CPU package) and sensors the EC itself ignores for fan control are
    only used to judge throttling. Sensors that barely react (battery) are dropped.
 5. **Sustained load:** Runs at increasing fixed fan speeds until the board temperature
-   settles. The first speed at which the CPU no longer throttles thermally, measured with
-   `package_throttle_count` (or, without that counter, the package staying below 95 °C), is
-   the anchor of the curve.
+   settles. The first speed at which the CPU is no longer *thermally* limited is the anchor
+   of the curve. The checks, best signal first:
+   - **Throttle time:** time spent throttled from `package_throttle_total_time_ms`, at most
+     1 % of the last 60 s.
+   - **Throttle events plus power:** if the throttle time is not available, no new throttle
+     events, and the package is either below 95 °C or drawing at least 90 % of its RAPL PL1.
+     At PL1 the CPU is power-limited, and more fan would not help.
+   - **Package temperature only:** without RAPL, the package must stay below 95 °C.
+
+   The event counter alone proves nothing, because it only increments when throttling
+   starts, not while it continues.
 
 The generated strategy is off until a few degrees above idle, rises gently to the anchor
 and reaches 100 % at the EC's own `fan_max` for the dominant sensor. `--prefer` shifts it:

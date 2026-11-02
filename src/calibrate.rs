@@ -137,25 +137,42 @@ pub struct Equilibrium {
     /// Index of the hottest board sensor.
     pub dominant: usize,
     pub spiky_max: Option<f64>,
-    /// Thermal throttle events in the last 60 s (None = not measurable).
+    /// Time spent thermally throttled in the last 60 s
+    /// (`package_throttle_total_time_ms`; None = not available).
+    pub throttle_ms: Option<u64>,
+    /// New throttle events in the last 60 s. Weak signal: the counter only
+    /// increments on entering throttling, not while staying throttled.
     pub throttle_events: Option<u64>,
+    /// Package power over the last 20 s and the long-term limit (RAPL PL1).
+    pub package_w: Option<f64>,
+    pub pl1_w: Option<f64>,
     pub mhz: Option<f64>,
     /// A sensor came within 2 °C of its EC "high" threshold.
     pub guard_hit: bool,
 }
 
 impl Equilibrium {
+    /// The CPU is limited by its power budget, not by temperature.
+    pub fn power_limited(&self) -> bool {
+        matches!((self.package_w, self.pl1_w), (Some(p), Some(l)) if l > 0.0 && p >= 0.9 * l)
+    }
+
     /// No thermal throttling at this duty.
     pub fn ok(&self) -> bool {
         if self.guard_hit {
             return false;
         }
-        match (self.throttle_events, self.spiky_max) {
-            (Some(n), _) => n == 0,
-            // no throttle counter (e.g. AMD): keep the package clear of ~TjMax
-            (None, Some(t)) => t < 95.0,
-            (None, None) => true,
+        // Best signal: accumulated throttle time (allow 1 % of the window).
+        if let Some(ms) = self.throttle_ms {
+            return ms <= 600;
         }
+        if self.throttle_events.is_some_and(|n| n > 0) {
+            return false;
+        }
+        // A package sitting near TjMax while drawing less than PL1 is held back
+        // by temperature. Without RAPL, near-TjMax alone counts as throttling.
+        let hot = self.spiky_max.is_some_and(|t| t >= 95.0);
+        !(hot && !self.power_limited())
     }
 }
 
@@ -332,12 +349,45 @@ impl Load {
     }
 }
 
-fn throttle_count() -> Option<u64> {
-    fs::read_to_string("/sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+fn read_u64(path: &str) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+const THROTTLE_DIR: &str = "/sys/devices/system/cpu/cpu0/thermal_throttle";
+const RAPL_DIR: &str = "/sys/class/powercap/intel-rapl:0";
+
+#[derive(Debug, Clone, Copy)]
+struct CpuSample {
+    at: Instant,
+    throttle_ms: Option<u64>,
+    throttle_count: Option<u64>,
+    energy_uj: Option<u64>,
+}
+
+impl CpuSample {
+    fn now() -> CpuSample {
+        CpuSample {
+            at: Instant::now(),
+            throttle_ms: read_u64(&format!("{THROTTLE_DIR}/package_throttle_total_time_ms")),
+            throttle_count: read_u64(&format!("{THROTTLE_DIR}/package_throttle_count")),
+            energy_uj: read_u64(&format!("{RAPL_DIR}/energy_uj")),
+        }
+    }
+}
+
+fn delta(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    Some(b?.saturating_sub(a?))
+}
+
+/// Average package power between two samples (None on counter wrap or missing RAPL).
+fn watts(a: &CpuSample, b: &CpuSample) -> Option<f64> {
+    let (ea, eb) = (a.energy_uj?, b.energy_uj?);
+    let secs = b.at.duration_since(a.at).as_secs_f64();
+    (eb >= ea && secs > 0.0).then(|| (eb - ea) as f64 / 1e6 / secs)
+}
+
+fn pl1_watts() -> Option<f64> {
+    read_u64(&format!("{RAPL_DIR}/constraint_0_power_limit_uw")).map(|uw| uw as f64 / 1e6)
 }
 
 fn avg_mhz() -> Option<f64> {
@@ -580,11 +630,11 @@ fn measure(ec: &CrosEc, opts: &Options) -> Result<()> {
         ec.send(EcCommand::SetFanDuty(duty))?;
         let mut board_series = Vec::new();
         let mut rows = Vec::new();
-        let mut counts = Vec::new();
+        let mut cpu = Vec::new();
         let mut guard_hit = false;
         for s in 0..240 {
             let (row, hit) = sampler.sample()?;
-            counts.push(throttle_count());
+            cpu.push(CpuSample::now());
             if let Some((t, _)) = max_of(&row, &board) {
                 board_series.push(t);
             }
@@ -607,34 +657,41 @@ fn measure(ec: &CrosEc, opts: &Options) -> Result<()> {
             .iter()
             .filter_map(|&i| column(last, i).into_iter().reduce(f64::max))
             .reduce(f64::max);
-        let window = &counts[counts.len().saturating_sub(60)..];
-        let throttle_events = match (
-            window.first().copied().flatten(),
-            window.last().copied().flatten(),
-        ) {
-            (Some(a), Some(b)) => Some(b.saturating_sub(a)),
-            _ => None,
-        };
+        let (w60, w20) = (
+            &cpu[cpu.len().saturating_sub(60)..],
+            &cpu[cpu.len().saturating_sub(20)..],
+        );
+        let (first, last_s) = (w60[0], w60[w60.len() - 1]);
+        let throttle_ms = delta(first.throttle_ms, last_s.throttle_ms);
+        let throttle_events = delta(first.throttle_count, last_s.throttle_count);
+        let package_w = watts(&w20[0], &w20[w20.len() - 1]);
         let eq = Equilibrium {
             duty,
             rpm: rpm(ec),
             board_temp,
             dominant,
             spiky_max,
+            throttle_ms,
             throttle_events,
+            package_w,
+            pl1_w: pl1_watts(),
             mhz: avg_mhz(),
             guard_hit,
         };
+        let na = || "n/a".to_string();
         eprintln!(
-            "  {:>3}% ({} RPM): board {:.1}°C (sensor {}), package {}, throttle events {}, {} → {}",
+            "  {:>3}% ({} RPM): board {:.1}°C (sensor {}), package {}, throttled {} ms/60 s ({} events), {} of PL1 {}, {} → {}",
             eq.duty,
             eq.rpm,
             eq.board_temp,
             eq.dominant,
             eq.spiky_max.map_or("-".into(), |t| format!("{t:.0}°C")),
-            eq.throttle_events.map_or("n/a".into(), |n| n.to_string()),
+            eq.throttle_ms.map_or_else(na, |n| n.to_string()),
+            eq.throttle_events.map_or_else(na, |n| n.to_string()),
+            eq.package_w.map_or_else(na, |w| format!("{w:.1} W")),
+            eq.pl1_w.map_or_else(na, |w| format!("{w:.0} W")),
             eq.mhz.map_or("-".into(), |m| format!("{m:.0} MHz")),
-            if eq.ok() { "ok" } else { "throttling" }
+            if eq.ok() { "ok" } else { "thermally limited" }
         );
         let ok = eq.ok();
         results.push(eq);
@@ -770,7 +827,10 @@ mod tests {
             board_temp: temp,
             dominant: 1,
             spiky_max: Some(96.0),
+            throttle_ms: Some(0),
             throttle_events: Some(0),
+            package_w: Some(20.0),
+            pl1_w: Some(28.0),
             mhz: None,
             guard_hit: false,
         }
@@ -834,15 +894,37 @@ mod tests {
     #[test]
     fn throttle_judgement() {
         let mut e = eq(30, 60.0);
+        // throttle time is authoritative
         assert!(e.ok());
-        e.throttle_events = Some(3);
+        e.throttle_ms = Some(601);
         assert!(!e.ok());
-        e.throttle_events = None; // AMD: judge by package temp
-        assert!(!e.ok()); // 96 °C package is too close to TjMax
-        e.spiky_max = Some(90.0);
+        e.throttle_ms = Some(500);
+        e.throttle_events = Some(3); // events are ignored when time is available
         assert!(e.ok());
-        e.guard_hit = true;
+
+        // without throttle time: a static event counter is not proof (continuous throttling)
+        e.throttle_ms = None;
+        e.throttle_events = Some(0);
+        assert!(
+            !e.ok(),
+            "96 °C package below PL1 (20 of 28 W) is thermally limited"
+        );
+        e.package_w = Some(27.0);
+        assert!(
+            e.ok(),
+            "at PL1 the CPU is power limited, more fan would not help"
+        );
+        e.throttle_events = Some(1);
         assert!(!e.ok());
+
+        // no RAPL, no counters (e.g. some AMD setups): near-TjMax counts as throttling
+        let mut a = eq(30, 60.0);
+        (a.throttle_ms, a.throttle_events, a.package_w, a.pl1_w) = (None, None, None, None);
+        assert!(!a.ok());
+        a.spiky_max = Some(90.0);
+        assert!(a.ok());
+        a.guard_hit = true;
+        assert!(!a.ok());
     }
 
     #[test]
