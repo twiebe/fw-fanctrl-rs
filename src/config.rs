@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 use crate::error::{Error, Result, bail};
 
 pub const DEFAULT_CONFIG: &str = include_str!("../resources/config.json");
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/fw-fanctrl/config.json";
 pub const SCHEMA_REF: &str = "./config.schema.json";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,10 +248,14 @@ impl Config {
         })
     }
 
-    /// Load the configuration, writing the built-in default first if the file is missing
-    /// (same as upstream).
+    /// Load the configuration. Like upstream, a missing file at the default path is
+    /// created from the built-in default. Any other missing path is an error, so a
+    /// mistyped `--config` cannot silently run the default strategies.
     pub fn load(path: &Path) -> Result<Config> {
         if !path.exists() {
+            if path != Path::new(DEFAULT_CONFIG_PATH) {
+                bail!("configuration file {} does not exist", path.display());
+            }
             if let Some(dir) = path.parent() {
                 fs::create_dir_all(dir)?;
             }
@@ -429,7 +434,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fwfan-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        let c = Config::load(&path).unwrap(); // creates default
+        let err = Config::load(&path).unwrap_err().0; // only the default path is auto-created
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(!path.exists());
+        let c = Config::parse(DEFAULT_CONFIG).unwrap();
         c.save(&path).unwrap();
         let again = Config::load(&path).unwrap();
         assert_eq!(c.data, again.data);

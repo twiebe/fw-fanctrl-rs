@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::error::{Result, bail};
 use crate::output::OutputFormat;
 
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/fw-fanctrl/config.json";
+pub use crate::config::DEFAULT_CONFIG_PATH;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
