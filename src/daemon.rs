@@ -77,7 +77,12 @@ impl Service {
                 svc.overwritten = Some(s.into())
             }
             Some(s) if !s.is_empty() => {
-                eprintln!("unknown strategy '{s}', using the default strategy")
+                eprintln!(
+                    "[Warning] > unknown strategy '{s}' in {}, using the default strategy '{}' (available: {})",
+                    svc.config_path.display(),
+                    svc.config.default_strategy,
+                    svc.config.names().join(", ")
+                )
             }
             _ => {}
         }
