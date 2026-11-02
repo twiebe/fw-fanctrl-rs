@@ -417,8 +417,10 @@ impl Service {
                 strategy,
                 discharging,
             } => {
-                if self.config.strategy(strategy).is_none() {
-                    return Reply::Error(format!("The specified strategy is invalid: {strategy}"));
+                if let Some(name) = strategy
+                    && self.config.strategy(name).is_none()
+                {
+                    return Reply::Error(format!("The specified strategy is invalid: {name}"));
                 }
                 let key = if *discharging {
                     "strategyOnDischarging"
@@ -426,7 +428,8 @@ impl Service {
                     "defaultStrategy"
                 };
                 let mut data = self.config.data.clone();
-                data[key] = serde_json::Value::String(strategy.clone());
+                // None (--clear, discharging only): "" = use the default strategy
+                data[key] = serde_json::Value::String(strategy.clone().unwrap_or_default());
                 let result = Config::parse(&data.to_string()).and_then(|c| self.replace_config(c));
                 if let Err(e) = result {
                     return Reply::Error(e.0);
@@ -1022,6 +1025,15 @@ mod tests {
             ),
             r#"{"status": "success", "defaultStrategy": "agile", "strategyOnDischarging": "deaf", "strategy": "agile", "default": true}"#
         );
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.strategy_on_discharging, "deaf");
+        assert!(
+            answer(&s, "set-default --discharging --clear", Some(0))
+                .contains("Discharging strategy: ''")
+        );
+        let saved = Config::load(&path).unwrap();
+        assert_eq!(saved.strategy_on_discharging, "");
+        answer(&s, "set-default deaf --discharging", Some(0));
         let saved = Config::load(&path).unwrap();
         assert_eq!(
             (

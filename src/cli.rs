@@ -44,8 +44,9 @@ pub enum Command {
     Print(PrintSelection),
     SetConfig(String),
     /// Set `defaultStrategy` (or `strategyOnDischarging`) in the configuration file.
+    /// `strategy: None` (`--clear`) unsets `strategyOnDischarging`.
     SetDefault {
-        strategy: String,
+        strategy: Option<String>,
         discharging: bool,
     },
     // local-only extras
@@ -102,6 +103,8 @@ commands:
   set-default <strategy> [--discharging]
                       make a strategy the default (or the one used on battery) and save
                       it in the configuration file (root only)
+  set-default --discharging --clear
+                      use the default strategy on battery as well (root only)
 
 local commands (need root, do not talk to the service):
   probe               print EC temperatures, fan speeds and AC state
@@ -231,6 +234,7 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
         "set-default" => {
             let mut strategy = None;
             let mut discharging = false;
+            let mut clear = false;
             while let Some(tok) = t.peek() {
                 if tok == "-h" || tok == "--help" {
                     break;
@@ -238,17 +242,24 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
                 t.next();
                 match tok {
                     "--discharging" => discharging = true,
+                    "--clear" => clear = true,
                     _ if tok.starts_with('-') => bail!("unrecognized arguments: {tok}"),
                     _ if strategy.is_none() => strategy = Some(tok.to_string()),
                     _ => bail!("unrecognized arguments: {tok}"),
                 }
             }
-            match strategy {
-                Some(strategy) => Command::SetDefault {
+            match (strategy, clear) {
+                (Some(_), true) => bail!("set-default: give either a strategy or --clear"),
+                (None, true) if !discharging => {
+                    bail!(
+                        "set-default: --clear only works with --discharging (a default strategy is required)"
+                    )
+                }
+                (None, false) => bail!("the following arguments are required: strategy"),
+                (strategy, _) => Command::SetDefault {
                     strategy,
                     discharging,
                 },
-                None => bail!("the following arguments are required: strategy"),
             }
         }
         "probe" if !remote => Command::Probe,
@@ -461,12 +472,27 @@ mod tests {
                 .unwrap()
                 .command,
             Command::SetDefault {
-                strategy: "calibrated-quiet".into(),
+                strategy: Some("calibrated-quiet".into()),
                 discharging: true
             }
         );
-        assert!(p("set-default", true).is_err());
-        assert!(p("set-default a b", true).is_err());
+        assert_eq!(
+            p("set-default --discharging --clear", true)
+                .unwrap()
+                .command,
+            Command::SetDefault {
+                strategy: None,
+                discharging: true
+            }
+        );
+        for bad in [
+            "set-default",
+            "set-default a b",
+            "set-default --clear",
+            "set-default a --discharging --clear",
+        ] {
+            assert!(p(bad, true).is_err(), "{bad}");
+        }
         assert_eq!(
             p(r#"set_config '{"a": 1}'"#, true).unwrap().command,
             Command::SetConfig(r#"{"a": 1}"#.into())

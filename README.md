@@ -93,11 +93,13 @@ Added by fw-fanctrl-rs:
 
 ```
 fw-fanctrl set-default <strategy> [--discharging]
+fw-fanctrl set-default --discharging --clear
 ```
 
 `set-default` makes a strategy the `defaultStrategy` (with `--discharging`: the
-`strategyOnDischarging`). It saves the configuration file and the service switches at once.
-Like `set_config`, it is only accepted from root.
+`strategyOnDischarging`). `--discharging --clear` sets `strategyOnDischarging` back to `""`,
+so the default strategy is used on battery as well. The configuration file is saved and the
+service switches at once. Like `set_config`, it is only accepted from root.
 
 `print all` additionally reports `TargetSpeed`, the fan RPM, the reading of every
 sensor and whether the fail-safe is active. `kill -HUP` (or `systemctl reload fw-fanctrl`) reloads the config.
