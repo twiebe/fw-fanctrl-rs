@@ -24,7 +24,8 @@ Each strategy may additionally define:
 | `rampUpRate`    | %/s  | instant    | Maximum increase of the fan duty per second. |
 | `rampDownRate`  | %/s  | instant    | Maximum decrease of the fan duty per second. |
 | `rampDownDelay` | s    | `0`        | How long the target has to stay below the current speed before the fan starts slowing down. Short load drops are ignored. |
-| `criticalTemp`  | °C   | none       | At or above this *raw* temperature, averaging and ramp-up limiting are bypassed and the fan goes straight to the curve value. |
+| `criticalTemp`  | °C   | none       | At or above this *raw* temperature (of the selected sensors), averaging and ramp-up limiting are bypassed and the fan goes straight to the curve value. |
+| `sensors`       | list | all        | EC sensor indices whose maximum drives the curve, e.g. `[0, 1, 3]`. Indices are those shown by `fw-fanctrl probe` and `framework_tool --thermalget`. |
 
 A strategy without these keys behaves exactly like upstream. Example (also shipped as
 the `smooth` strategy in the default config):
@@ -47,6 +48,19 @@ the `smooth` strategy in the default config):
     "criticalTemp": 90
 }
 ```
+
+### Choosing sensors
+
+Upstream uses the hottest of all sensors. On Intel Framework laptops that is
+`peci-temp`, the CPU package temperature, which jumps by 20 °C within a second under
+load and makes the fan nervous. The EC's own automatic control effectively ignores PECI
+(its `fan_off`/`fan_max` thresholds are 103/105 °C) and follows the board sensors, which
+react slowly. Selecting those board sensors gives naturally smooth behaviour, and the CPU
+still protects itself by throttling. Compare `sudo framework_tool --thermalget` with
+`sudo fw-fanctrl probe` to find the indices on your machine.
+[`examples/framework13-intel.json`](examples/framework13-intel.json) is a quiet,
+MacBook-like strategy tuned on a Framework 13 (Intel) that uses local, CPU and DDR board
+sensors. On that machine 10 % duty ≈ 900 RPM, 30 % ≈ 2800, 50 % ≈ 4150 and 100 % ≈ 6640 RPM.
 
 Rates are used instead of a fixed ramp duration on purpose. With a fixed duration,
 a change from 20 to 25 % takes as long as one from 20 to 100 %. With a rate, small
@@ -71,16 +85,16 @@ fw-fanctrl set_config '<json>'
 fw-fanctrl run [strategy] [--config PATH] [--silent]
 ```
 
-`print all` additionally reports `TargetSpeed`, the fan RPM and whether the
-fail-safe is active. `kill -HUP` (or `systemctl reload fw-fanctrl`) reloads the config.
+`print all` additionally reports `TargetSpeed`, the fan RPM, the reading of every
+sensor and whether the fail-safe is active. `kill -HUP` (or `systemctl reload fw-fanctrl`) reloads the config.
 
 The following extras run locally as root and do not talk to the service:
 
 | Command | Purpose |
 |---------|---------|
 | `run --dry-run` | Read the real sensors and run the full control loop, but never write to the EC. |
-| `run --simulate FILE` | No hardware at all. The temperature is read from `FILE`, for testing the loop anywhere. |
-| `probe` | Print EC temperatures, fan RPM and AC state. |
+| `run --simulate FILE` | No hardware at all. Temperatures are read from `FILE` (one value per sensor index, `-` for none, e.g. `38 45 - 36 72`), for testing the loop anywhere. |
+| `probe` | Print EC temperatures per sensor index, fan RPM and AC state. |
 | `test-fan <percent> [--seconds N]` | Set one duty for N seconds (default 5), then hand control back to the EC. |
 | `restore-auto` | Hand fan control back to the EC. |
 

@@ -1,0 +1,28 @@
+{
+    "$schema": "../resources/config.schema.json",
+    "defaultStrategy": "mac",
+    "strategyOnDischarging": "",
+    "strategies": {
+        "mac": {
+            "fanSpeedUpdateFrequency": 2,
+            "movingAverageInterval": 20,
+            "sensors": [0, 1, 3],
+            "speedCurve": [
+                { "temp": 0, "speed": 0 },
+                { "temp": 44, "speed": 0 },
+                { "temp": 46, "speed": 10 },
+                { "temp": 50, "speed": 14 },
+                { "temp": 55, "speed": 20 },
+                { "temp": 60, "speed": 26 },
+                { "temp": 65, "speed": 33 },
+                { "temp": 70, "speed": 45 },
+                { "temp": 75, "speed": 65 },
+                { "temp": 80, "speed": 100 }
+            ],
+            "rampUpRate": 0.5,
+            "rampDownRate": 0.2,
+            "rampDownDelay": 30,
+            "criticalTemp": 80
+        }
+    }
+}

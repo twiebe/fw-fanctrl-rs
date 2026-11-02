@@ -144,7 +144,18 @@
                     "type": "number",
                     "minimum": 0,
                     "maximum": 110,
-                    "description": "fw-fanctrl-rs: at or above this raw temperature (degrees Celsius) ramp-up limiting and averaging are bypassed and the fan goes straight to the curve value."
+                    "description": "fw-fanctrl-rs: at or above this raw temperature (degrees Celsius, of the selected sensors) ramp-up limiting and averaging are bypassed and the fan goes straight to the curve value."
+                },
+                "sensors": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 23
+                    },
+                    "description": "fw-fanctrl-rs: EC temperature sensor indices (as shown by `fw-fanctrl probe` / `framework_tool --thermalget`) whose maximum drives the curve. Omit to use all sensors (upstream behaviour)."
                 }
             },
             "required": [

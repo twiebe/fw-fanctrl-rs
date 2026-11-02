@@ -13,7 +13,7 @@ use crate::config::{Config, Strategy};
 use crate::control::{Controller, Tick};
 use crate::ec::Fan;
 use crate::error::Result;
-use crate::hw::Hardware;
+use crate::hw::{self, Hardware};
 use crate::output::{OutputFormat, Reply, Status};
 use crate::signals::{self, Signal};
 use crate::systemd;
@@ -41,6 +41,7 @@ pub struct Service {
     on_ac: bool,
     last: Tick,
     fans: Vec<Fan>,
+    sensor_temps: Vec<Option<f64>>,
     failures: u32,
     failsafe: bool,
     last_write: Option<(u8, Instant)>,
@@ -64,6 +65,7 @@ impl Service {
             on_ac: true,
             last: Tick::default(),
             fans: Vec::new(),
+            sensor_temps: Vec::new(),
             failures: 0,
             failsafe: false,
             last_write: None,
@@ -126,16 +128,22 @@ impl Service {
         if !self.active {
             return;
         }
-        let temp = match self.hw.temperature() {
-            Ok(t) => t,
-            Err(e) => return self.fail(format!("reading temperature failed: {e}")),
-        };
+        // AC state first: it decides the strategy, which decides the sensors.
         if let Ok(ac) = self.hw.on_ac() {
             self.on_ac = ac;
         }
+        let strategy = self.current_strategy().clone();
+        let temps = match self.hw.temperatures() {
+            Ok(t) => t,
+            Err(e) => return self.fail(format!("reading temperatures failed: {e}")),
+        };
+        self.sensor_temps = temps.clone();
+        let temp = match hw::select_max(&temps, strategy.sensors.as_deref()) {
+            Ok(t) => t,
+            Err(e) => return self.fail(format!("reading temperatures failed: {e}")),
+        };
         self.fans = self.hw.fans().unwrap_or_default();
 
-        let strategy = self.current_strategy().clone();
         let tick = self.controller.tick(&strategy, temp, TICK.as_secs_f64());
         self.last = tick;
 
@@ -176,6 +184,7 @@ impl Service {
                     Fan::Stalled => None,
                 })
                 .collect(),
+            sensors: self.sensor_temps.clone(),
             config_path: self.config_path.display().to_string(),
             config: self.config.data.clone(),
         }
@@ -466,13 +475,14 @@ mod tests {
     }
 
     impl Hardware for Mock {
-        fn temperature(&mut self) -> Result<f64> {
+        fn temperatures(&mut self) -> Result<Vec<Option<f64>>> {
             let mut t = self.temps.lock().unwrap();
-            if t.len() > 1 {
+            let next = if t.len() > 1 {
                 t.remove(0)
             } else {
                 t[0].as_ref().map(|v| *v).map_err(|e| Error(e.0.clone()))
-            }
+            };
+            next.map(|v| vec![Some(v)])
         }
         fn set_speed(&mut self, p: u8) -> Result<()> {
             self.log.lock().unwrap().push(format!("set {p}"));

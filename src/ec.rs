@@ -168,8 +168,9 @@ impl CrosEc {
         Ok(rm.buffer[..len as usize].to_vec())
     }
 
-    /// All valid temperature sensor readings in °C.
-    pub fn temperatures(&self) -> Result<Vec<i32>> {
+    /// Temperature per sensor index in °C (`None` = not present / invalid).
+    /// Indices match `framework_tool --thermal` / `--thermalget`.
+    pub fn temperatures(&self) -> Result<Vec<Option<i32>>> {
         let mut raw = self.read_mem(EC_MEMMAP_TEMP_SENSOR, 16)?;
         if self.read_mem(EC_MEMMAP_THERMAL_VERSION, 1)?[0] >= 2 {
             raw.extend(self.read_mem(EC_MEMMAP_TEMP_SENSOR_B, 8)?);
@@ -186,10 +187,9 @@ impl CrosEc {
     }
 }
 
-fn decode_temps(raw: &[u8]) -> Vec<i32> {
+fn decode_temps(raw: &[u8]) -> Vec<Option<i32>> {
     raw.iter()
-        .filter(|&&b| b < TEMP_FIRST_INVALID)
-        .map(|&b| b as i32 + TEMP_RAW_TO_CELSIUS)
+        .map(|&b| (b < TEMP_FIRST_INVALID).then_some(b as i32 + TEMP_RAW_TO_CELSIUS))
         .collect()
 }
 
@@ -241,10 +241,10 @@ mod tests {
 
     #[test]
     fn temperature_decoding() {
-        // 0x7f = 127 → 54 °C; 0x89 → 64 °C; invalid markers skipped
+        // 0x7f = 127 → 54 °C; 0x89 → 64 °C; invalid markers keep their index as None
         assert_eq!(
             decode_temps(&[0x7f, 0xff, 0x89, 0xfe, 0xfd, 0xfc]),
-            [54, 64]
+            [Some(54), None, Some(64), None, None, None]
         );
     }
 

@@ -152,6 +152,7 @@ mod tests {
                 },
             ],
             ramp,
+            sensors: None,
         }
     }
 

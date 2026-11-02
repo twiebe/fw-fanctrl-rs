@@ -22,6 +22,8 @@ pub struct Status {
     pub active: bool,
     pub failsafe: bool,
     pub fan_rpm: Vec<Option<u16>>,
+    /// Raw reading per sensor index.
+    pub sensors: Vec<Option<f64>>,
     pub config_path: String,
     pub config: Value,
 }
@@ -143,6 +145,15 @@ impl Reply {
                 if !rpm.is_empty() {
                     out += &format!("FanRPM: {}{nl}", rpm.join(", "));
                 }
+                let sensors: Vec<String> = s
+                    .sensors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, t)| t.map(|t| format!("{i}={t}")))
+                    .collect();
+                if !sensors.is_empty() {
+                    out += &format!("Sensors: {}{nl}", sensors.join(" "));
+                }
                 out += &format!(
                     "DefaultStrategy: '{}'{nl}DischargingStrategy: '{}'{nl}",
                     s.config["defaultStrategy"].as_str().unwrap_or(""),
@@ -191,6 +202,7 @@ impl Reply {
                 "targetSpeed": s.target_speed,
                 "failsafe": s.failsafe,
                 "fanRpm": s.fan_rpm,
+                "sensorTemperatures": s.sensors,
             }),
         }
     }

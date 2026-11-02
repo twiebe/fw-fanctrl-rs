@@ -128,15 +128,20 @@ fn probe(fmt: OutputFormat) -> Result<()> {
                 Fan::Stalled => None,
             })
             .collect();
-        let v = serde_json::json!({"temperatures": temps, "max": temps.iter().max(), "fanRpm": fans, "ac": ac});
+        let v = serde_json::json!({"temperatures": temps, "max": temps.iter().flatten().max(), "fanRpm": fans, "ac": ac});
         println!("{}", output::to_py_json(&v));
     } else {
-        let t: Vec<String> = temps.iter().map(|t| format!("{t}°C")).collect();
-        println!("Temperatures: {}", t.join(", "));
+        // indices match `framework_tool --thermalget` and the `sensors` config key
+        for (i, t) in temps.iter().enumerate() {
+            if let Some(t) = t {
+                println!("Sensor {i:>2}: {t}°C");
+            }
+        }
         println!(
             "Max: {}",
             temps
                 .iter()
+                .flatten()
                 .max()
                 .map_or("n/a".into(), |t| format!("{t}°C"))
         );
@@ -166,6 +171,7 @@ fn test_fan(percent: u8, seconds: u64) -> Result<()> {
                     fans_str(&ec.fans().unwrap_or_default()),
                     temps
                         .iter()
+                        .flatten()
                         .max()
                         .map_or("n/a".into(), |t| format!("{t}°C"))
                 );

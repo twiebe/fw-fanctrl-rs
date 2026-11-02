@@ -39,6 +39,8 @@ pub struct Strategy {
     pub moving_average_interval: u32,
     pub speed_curve: Vec<CurvePoint>,
     pub ramp: Ramp,
+    /// Sensor indices whose maximum drives the curve; `None` = all (upstream).
+    pub sensors: Option<Vec<u8>>,
 }
 
 impl Strategy {
@@ -97,7 +99,11 @@ struct RawStrategy {
     ramp_down_rate: Option<f64>,
     ramp_down_delay: Option<f64>,
     critical_temp: Option<f64>,
+    sensors: Option<Vec<u8>>,
 }
+
+/// EC memory map: 16 sensors in bank A plus 8 in bank B.
+pub const MAX_SENSORS: u8 = 24;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,6 +169,22 @@ fn parse_strategy(name: &str, value: &Value) -> Result<Strategy> {
     if let Some(t) = raw.critical_temp {
         check_range(name, "criticalTemp", t, 0.0, 110.0)?;
     }
+    if let Some(sensors) = &raw.sensors {
+        if sensors.is_empty() {
+            bail!("strategy '{name}': sensors must not be empty (omit it to use all sensors)");
+        }
+        for (i, &idx) in sensors.iter().enumerate() {
+            if idx >= MAX_SENSORS {
+                bail!(
+                    "strategy '{name}': sensor index {idx} out of range (0-{})",
+                    MAX_SENSORS - 1
+                );
+            }
+            if sensors[..i].contains(&idx) {
+                bail!("strategy '{name}': sensor index {idx} listed twice");
+            }
+        }
+    }
 
     Ok(Strategy {
         name: name.to_string(),
@@ -175,6 +197,7 @@ fn parse_strategy(name: &str, value: &Value) -> Result<Strategy> {
             down_delay,
             critical_temp: raw.critical_temp,
         },
+        sensors: raw.sensors,
     })
 }
 
@@ -370,6 +393,18 @@ mod tests {
             (
                 r#"{"defaultStrategy":"a","strategyOnDischarging":"","strategies":{"a b":{"speedCurve":[{"temp":0,"speed":1}]}}}"#,
                 "invalid strategy name",
+            ),
+            (
+                r#"{"defaultStrategy":"a","strategyOnDischarging":"","strategies":{"a":{"speedCurve":[{"temp":0,"speed":1}],"sensors":[]}}}"#,
+                "must not be empty",
+            ),
+            (
+                r#"{"defaultStrategy":"a","strategyOnDischarging":"","strategies":{"a":{"speedCurve":[{"temp":0,"speed":1}],"sensors":[1,24]}}}"#,
+                "out of range",
+            ),
+            (
+                r#"{"defaultStrategy":"a","strategyOnDischarging":"","strategies":{"a":{"speedCurve":[{"temp":0,"speed":1}],"sensors":[1,1]}}}"#,
+                "twice",
             ),
             (
                 r#"{"defaultStrategy":"a","foo":1,"strategies":{"a":{"speedCurve":[{"temp":0,"speed":1}]}}}"#,
