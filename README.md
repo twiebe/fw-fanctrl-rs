@@ -51,16 +51,17 @@ the `smooth` strategy in the default config):
 
 ### Choosing sensors
 
-Upstream uses the hottest of all sensors. On Intel Framework laptops that is
+Upstream uses the hottest of all sensors. On the Intel Framework 13 Pro that is
 `peci-temp`, the CPU package temperature, which jumps by 20 °C within a second under
 load and makes the fan nervous. The EC's own automatic control effectively ignores PECI
 (its `fan_off`/`fan_max` thresholds are 103/105 °C) and follows the board sensors, which
 react slowly. Selecting those board sensors gives naturally smooth behaviour, and the CPU
 still protects itself by throttling. Compare `sudo framework_tool --thermalget` with
 `sudo fw-fanctrl probe` to find the indices on your machine.
-[`examples/framework13-intel.json`](examples/framework13-intel.json) is a quiet,
-MacBook-like strategy tuned on a Framework 13 (Intel) that uses local, CPU and DDR board
-sensors. On that machine 10 % duty ≈ 900 RPM, 30 % ≈ 2800, 50 % ≈ 4150 and 100 % ≈ 6640 RPM.
+[`examples/framework13-pro-intel-core-ultra-3.json`](examples/framework13-pro-intel-core-ultra-3.json)
+is a quiet, MacBook-like strategy tuned on a Framework 13 Pro with Intel Core Ultra
+Series 3 that uses local, CPU and DDR board sensors. The AMD variant has a different
+sensor layout, so check its indices before reusing the example. On the Intel machine 10 % duty ≈ 900 RPM, 30 % ≈ 2800, 50 % ≈ 4150 and 100 % ≈ 6640 RPM.
 
 Rates are used instead of a fixed ramp duration on purpose. With a fixed duration,
 a change from 20 to 25 % takes as long as one from 20 to 100 %. With a rate, small
