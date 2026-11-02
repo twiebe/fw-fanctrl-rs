@@ -101,19 +101,27 @@ The following extras run locally as root and do not talk to the service:
 | `probe` | Print EC temperatures per sensor index, fan RPM and AC state. |
 | `test-fan <percent> [--seconds N]` | Set one duty for N seconds (default 5), then hand control back to the EC. |
 | `restore-auto` | Hand fan control back to the EC. |
-| `calibrate [...]` | Measure this machine and generate a strategy, see below. |
+| `calibrate measure` / `calibrate apply` | Measure this machine once and create strategies from it, see below. |
 
 `FW_FANCTRL_SOCKET` overrides the socket path (default
 `/run/fw-fanctrl/.fw-fanctrl.commands.sock`), which is useful for tests without root.
 
 ## Calibration
 
+Calibration has two steps. **Measure once**, which takes a while and needs the hardware.
+Then **apply** the result as often as you like, which is instant.
+
 ```sh
-sudo fw-fanctrl calibrate [--prefer quiet|balanced|cool] [--comfort-temp C] [--apply NAME] \
-                          [--load-cmd CMD] [--config PATH]
+sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH]
+sudo fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--dry-run]
+fw-fanctrl use calibrated-balanced
 ```
 
-The command takes about 15–30 minutes and puts all CPU cores under full load. The built-in
+### `calibrate measure`
+
+It takes about 30–40 minutes and puts all CPU cores under full load. The raw data is saved
+to `/etc/fw-fanctrl/calibration.json`, and a summary at the end shows the result for each
+preference and comfort temperature. The built-in
 load uses 256-bit FMA when the CPU supports it, which draws more power than integer code
 and comes closer to stress-ng, compilers and games. The calibration therefore errs on the
 warm side. A running service is paused for the duration and resumed afterwards. The phases:
@@ -129,10 +137,11 @@ warm side. A running service is paused for the duration and resumed afterwards. 
    only used to judge throttling. Sensors that barely react (battery) are dropped.
 5. **Sustained load:** First a reference run at 100 % fan. It measures the CPU frequency
    without any thermal limit. Then increasing fixed fan speeds, starting at the start duty,
-   each until the board temperature settles. The first speed at which the CPU is not
-   thermally limited is the anchor of the curve:
+   each until the board temperature settles. It stops once even `cool` is satisfied, so every
+   preference has an answer. `apply` later picks the quietest step that is good enough for
+   the chosen preference (the anchor of the curve):
    - **Performance decides:** The average frequency must reach a share of the reference
-     that `--prefer` sets (see the table below). Performance can be lost in two ways. The
+     that the preference sets (see the table below). Performance can be lost in two ways. The
      CPU throttles itself, or the platform lowers the power limit on a warm machine (e.g.
      thermald, which lowered PL1 from 33 to 30 W on the Framework 13 Pro). A hot package on
      its own proves nothing: a CPU at 92 °C running the same clocks as at full fan is not
@@ -141,8 +150,8 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      (`package_throttle_total_time_ms`) or new `package_throttle_count` events mark the
      speed as limited. They cannot prove the *absence* of throttling, because both only
      advance at the start or end of a throttle episode.
-   - **End reference:** If no speed passes, full fan is measured once more after the same
-     soak time, and all steps are judged again against it. Some power budgets are
+   - **End reference:** If no step satisfies `cool`, full fan is measured once more after
+     the same soak time, and the steps are also judged against it. Some power budgets are
      time-dependent, and then an early reference is unfairly fast. The quietest step that
      passes against the end reference becomes the anchor.
    - **Settled or capped:** Each step shows whether the board temperature settled or the
@@ -152,33 +161,45 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      "lowered from … W" when the limit dropped below the highest value seen.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
-6. **Idle comfort** (only with `--comfort-temp C`): Without load, the fan first cools the
-   board to C °C at full speed. A slow PI loop then holds it there for 4 minutes. The average
-   fan speed it needs becomes the fan-on point of the curve: off below C−2 °C, that speed at
-   C °C. The surface stays cool in idle and light use with as little fan as possible. If C is
-   not reachable in idle even at full fan, the option is ignored with a warning.
+6. **Idle comfort:** Without load, the fan first cools the board to 40 °C at full speed. A
+   slow PI loop then holds it at 40, 43 and 46 °C in turn (2.5 minutes each) and records the
+   average fan speed each needs. Targets that are not reachable even at full fan are skipped.
 
-The generated strategy is off until a few degrees above idle (or around the comfort
-temperature), rises gently to the anchor and reaches 100 % at the EC's own `fan_max` for the
-dominant sensor. `--prefer` shifts it:
+### `calibrate apply`
 
-`--prefer` sets the trade-off between noise and performance. The anchor is the quietest fan
+This turns the saved data into a strategy and adds it to the configuration as
+`calibrated-<preference>`, or as `--name`. The config is validated first, the previous file is
+kept as `config.json.bak-<timestamp>`, and a running service reloads it. `--dry-run` only
+prints the strategy. The output also says how old the measurement is.
+
+The generated strategy is off until a few degrees above idle, rises gently to the anchor and
+reaches 100 % at the EC's own `fan_max` for the dominant sensor. It also gets `minSpeed`.
+
+`--comfort-temp C` keeps the surface cool in idle and light use with as little fan as
+possible. The fan speed needed to hold the board at C °C is interpolated from the comfort
+measurement and becomes the fan-on point of the curve: off below C−2 °C, that speed at C °C.
+Outside 40–46 °C the nearest measured value is used, with a warning.
+
+The preference (default `balanced`) sets the trade-off between noise and performance. The anchor is the quietest fan
 speed that reaches this share of the full-fan performance, and real CPU throttling is never
 accepted. `quiet` is MacBook-like: it accepts that the platform lowers the power limit on a
 warm machine instead of spinning the fan up.
 
-| `--prefer` | Required performance | Fan starts at (without `--comfort-temp`) | Ramps (up / down / delay) | Framework 13 Pro example |
+| Preference | Required performance | Fan starts at (without `--comfort-temp`) | Ramps (up / down / delay) | Framework 13 Pro example |
 |------------|----------------------|---------------|---------------------------|-----|
-| `quiet` (default) | 85 % | idle + 4 °C | 0.5 / 0.2 %/s, 30 s | 40 % (3700 RPM) |
-| `balanced` | 92 % | idle + 3 °C | 1.0 / 0.3 %/s, 20 s | 55 % (4700 RPM) |
+| `quiet` | 85 % | idle + 4 °C | 0.5 / 0.2 %/s, 30 s | 40 % (3700 RPM) |
+| `balanced` (default) | 92 % | idle + 3 °C | 1.0 / 0.3 %/s, 20 s | 55 % (4700 RPM) |
 | `cool` | 97 % | idle + 2 °C | 2.0 / 0.5 %/s, 10 s | 100 % |
 
-The strategy is always printed as JSON. `--apply NAME` additionally stores it as strategy
-`NAME` in the configuration. The config is validated first, the previous file is kept as
-`config.json.bak-<timestamp>`, and a running service reloads it. Activate it with
-`fw-fanctrl use NAME`, or by setting `"defaultStrategy"`.
+For example, all three side by side, with the quiet one on battery:
 
-`--load-cmd` runs an additional load next to the CPU load, e.g. a GPU benchmark
+```sh
+for p in quiet balanced cool; do sudo fw-fanctrl calibrate apply $p --comfort-temp 43; done
+# then in /etc/fw-fanctrl/config.json:
+#   "defaultStrategy": "calibrated-balanced", "strategyOnDischarging": "calibrated-quiet"
+```
+
+`--load-cmd` (for `measure`) runs an additional load next to the CPU load, e.g. a GPU benchmark
 (`--load-cmd "glmark2 --run-forever"`). The command is split like a shell would split it,
 but it is not run through a shell, so it receives SIGTERM if the calibration dies. Use
 `sh -c '…'` explicitly for pipelines. It runs as root and is stopped at the end. Graphical
@@ -189,7 +210,7 @@ While calibrating, the running service is paused with a 30 s lease that is renew
 10 s. If the calibration is killed (even with `kill -9`), the service takes over the fan
 again within 30 s.
 
-Results depend on ambient temperature and on what is plugged in. Recalibrate if the
+Results depend on ambient temperature and on what is plugged in. Measure again if the
 conditions change a lot (summer, docked with the lid closed, and so on).
 
 ## Safety

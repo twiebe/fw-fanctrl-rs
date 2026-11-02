@@ -99,10 +99,11 @@ fn run_local(args: Args) -> Result<()> {
             daemon::run(svc, args.output_format, silent)
         }
         Command::Probe => probe(args.output_format),
-        Command::Calibrate(opts) => {
+        Command::CalibrateMeasure(opts) => {
             install_panic_failsafe();
-            calibrate::run(&opts)
+            calibrate::measure(&opts)
         }
+        Command::CalibrateApply(opts) => calibrate::apply(&opts),
         Command::TestFan { percent, seconds } => test_fan(percent, seconds),
         Command::RestoreAuto => {
             ec::restore_auto()?;

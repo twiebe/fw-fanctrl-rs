@@ -49,7 +49,8 @@ pub enum Command {
         percent: u8,
         seconds: u64,
     },
-    Calibrate(crate::calibrate::Options),
+    CalibrateMeasure(crate::calibrate::MeasureOptions),
+    CalibrateApply(crate::calibrate::ApplyOptions),
     RestoreAuto,
     Help,
 }
@@ -60,7 +61,8 @@ impl Command {
         matches!(
             self,
             Command::Run { .. }
-                | Command::Calibrate(_)
+                | Command::CalibrateMeasure(_)
+                | Command::CalibrateApply(_)
                 | Command::Probe
                 | Command::TestFan { .. }
                 | Command::RestoreAuto
@@ -98,11 +100,14 @@ local commands (need root, do not talk to the service):
   test-fan <percent> [--seconds N]
                       set the fan duty for N seconds (default 5), then restore EC control
   restore-auto        give fan control back to the EC
-  calibrate [--prefer quiet|balanced|cool] [--comfort-temp C] [--apply NAME]
-            [--load-cmd CMD] [--config PATH]
-                      measure fan and thermals (~15-30 min, puts the CPU under load) and
-                      print a strategy; --apply saves it as NAME in the configuration;
-                      --comfort-temp keeps the board (surface) at about C °C in idle
+  calibrate measure [--load-cmd CMD] [--output PATH]
+                      measure fan and thermals once (~30-40 min, puts the CPU under
+                      load) and save the data (default /etc/fw-fanctrl/calibration.json)
+  calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--dry-run]
+            [--config PATH] [--calibration PATH]
+                      create a strategy from the saved data (default: balanced, named
+                      calibrated-<preference>); --comfort-temp keeps the board (surface)
+                      at about C °C in idle; --dry-run only prints it
 ";
 
 struct Tokens<'a> {
@@ -272,43 +277,74 @@ fn parse_run(t: &mut Tokens) -> Result<Command> {
 }
 
 fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
-    use crate::calibrate::{Options, Prefer};
-    let mut opts = Options {
-        prefer: Prefer::Quiet,
-        load_cmd: None,
-        apply: None,
-        config: PathBuf::from(DEFAULT_CONFIG_PATH),
-        comfort_temp: None,
-    };
-    while let Some(tok) = t.peek() {
-        if tok == "-h" || tok == "--help" {
-            break;
-        }
-        t.next();
-        let (opt, inline) = split_opt(tok);
-        match opt {
-            "--prefer" => {
-                let v = t.value(opt, inline)?;
-                opts.prefer = match Prefer::parse(v) {
-                    Some(p) => p,
-                    None => bail!(
-                        "argument --prefer: invalid choice: '{v}' (choose from 'quiet', 'balanced', 'cool')"
-                    ),
-                };
+    use crate::calibrate::{ApplyOptions, CALIBRATION_PATH, MeasureOptions, Prefer};
+    match t.next() {
+        Some("measure") => {
+            let mut opts = MeasureOptions {
+                load_cmd: None,
+                output: PathBuf::from(CALIBRATION_PATH),
+            };
+            while let Some(tok) = t.peek() {
+                if tok == "-h" || tok == "--help" {
+                    break;
+                }
+                t.next();
+                let (opt, inline) = split_opt(tok);
+                match opt {
+                    "--load-cmd" => opts.load_cmd = Some(t.value(opt, inline)?.to_string()),
+                    "--output" | "-o" => opts.output = PathBuf::from(t.value(opt, inline)?),
+                    _ => bail!("unrecognized arguments: {tok}"),
+                }
             }
-            "--apply" => opts.apply = Some(t.value(opt, inline)?.to_string()),
-            "--load-cmd" => opts.load_cmd = Some(t.value(opt, inline)?.to_string()),
-            "--comfort-temp" => {
-                opts.comfort_temp = match t.value(opt, inline)?.parse::<f64>() {
-                    Ok(v) if (25.0..=80.0).contains(&v) => Some(v),
-                    _ => bail!("--comfort-temp must be between 25 and 80 °C"),
-                };
-            }
-            "--config" | "-c" => opts.config = PathBuf::from(t.value(opt, inline)?),
-            _ => bail!("unrecognized arguments: {tok}"),
+            Ok(Command::CalibrateMeasure(opts))
         }
+        Some("apply") => {
+            let mut opts = ApplyOptions {
+                prefer: Prefer::Balanced,
+                comfort_temp: None,
+                name: None,
+                dry_run: false,
+                config: PathBuf::from(DEFAULT_CONFIG_PATH),
+                calibration: PathBuf::from(CALIBRATION_PATH),
+            };
+            let mut prefer_seen = false;
+            while let Some(tok) = t.peek() {
+                if tok == "-h" || tok == "--help" {
+                    break;
+                }
+                t.next();
+                let (opt, inline) = split_opt(tok);
+                match opt {
+                    "--comfort-temp" => {
+                        opts.comfort_temp = match t.value(opt, inline)?.parse::<f64>() {
+                            Ok(v) if (25.0..=80.0).contains(&v) => Some(v),
+                            _ => bail!("--comfort-temp must be between 25 and 80 °C"),
+                        };
+                    }
+                    "--name" => opts.name = Some(t.value(opt, inline)?.to_string()),
+                    "--dry-run" => opts.dry_run = true,
+                    "--config" | "-c" => opts.config = PathBuf::from(t.value(opt, inline)?),
+                    "--calibration" => opts.calibration = PathBuf::from(t.value(opt, inline)?),
+                    _ if opt.starts_with('-') => bail!("unrecognized arguments: {tok}"),
+                    _ if !prefer_seen => {
+                        opts.prefer = match Prefer::parse(tok) {
+                            Some(p) => p,
+                            None => bail!(
+                                "invalid preference: '{tok}' (choose from 'quiet', 'balanced', 'cool')"
+                            ),
+                        };
+                        prefer_seen = true;
+                    }
+                    _ => bail!("unrecognized arguments: {tok}"),
+                }
+            }
+            Ok(Command::CalibrateApply(opts))
+        }
+        Some(other) => {
+            bail!("invalid calibrate command: '{other}' (choose from 'measure', 'apply')")
+        }
+        None => bail!("calibrate needs a command: 'measure' or 'apply'"),
     }
-    Ok(Command::Calibrate(opts))
 }
 
 fn parse_test_fan(t: &mut Tokens) -> Result<Command> {
@@ -394,16 +430,39 @@ mod tests {
 
     #[test]
     fn remote_cannot_run_local_commands() {
-        for c in ["run", "probe", "restore-auto", "test-fan 50", "calibrate"] {
+        for c in [
+            "run",
+            "probe",
+            "restore-auto",
+            "test-fan 50",
+            "calibrate measure",
+            "calibrate apply",
+        ] {
             assert!(p(c, true).is_err(), "{c}");
         }
     }
 
     #[test]
-    fn calibrate_options() {
+    fn calibrate_commands() {
         use crate::calibrate::Prefer;
-        let Command::Calibrate(o) = p(
-            r#"calibrate --prefer balanced --apply cal --load-cmd "vkcube --c 1""#,
+        let Command::CalibrateMeasure(m) =
+            p(r#"calibrate measure --load-cmd "vkcube --c 1""#, false)
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(m.load_cmd.as_deref(), Some("vkcube --c 1"));
+        assert_eq!(m.output, PathBuf::from("/etc/fw-fanctrl/calibration.json"));
+
+        let Command::CalibrateApply(a) = p("calibrate apply", false).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(a.prefer, Prefer::Balanced);
+        assert!(a.name.is_none() && !a.dry_run && a.comfort_temp.is_none());
+
+        let Command::CalibrateApply(a) = p(
+            "calibrate apply quiet --comfort-temp 43 --name mac --dry-run",
             false,
         )
         .unwrap()
@@ -411,15 +470,21 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(o.prefer, Prefer::Balanced);
-        assert_eq!(o.apply.as_deref(), Some("cal"));
-        assert_eq!(o.load_cmd.as_deref(), Some("vkcube --c 1"));
-        assert!(p("calibrate --prefer loud", false).is_err());
-        let Command::Calibrate(o) = p("calibrate --comfort-temp 40", false).unwrap().command else {
-            panic!()
-        };
-        assert_eq!(o.comfort_temp, Some(40.0));
-        assert!(p("calibrate --comfort-temp 10", false).is_err());
+        assert_eq!(a.prefer, Prefer::Quiet);
+        assert_eq!(a.comfort_temp, Some(43.0));
+        assert_eq!(a.name.as_deref(), Some("mac"));
+        assert!(a.dry_run);
+
+        for bad in [
+            "calibrate",
+            "calibrate run",
+            "calibrate apply loud",
+            "calibrate apply quiet cool",
+            "calibrate apply --comfort-temp 10",
+            "calibrate measure --prefer quiet",
+        ] {
+            assert!(p(bad, false).is_err(), "{bad}");
+        }
     }
 
     #[test]

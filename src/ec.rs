@@ -104,7 +104,7 @@ impl EcCommand {
 }
 
 /// EC thermal configuration of one sensor, in °C (`None` = disabled).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Thresholds {
     pub warn: Option<i32>,
     pub high: Option<i32>,

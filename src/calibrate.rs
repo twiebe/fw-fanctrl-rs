@@ -1,14 +1,15 @@
-//! `fw-fanctrl calibrate`: measure fan and thermal behaviour of this machine and
-//! derive a quiet strategy from it.
+//! `fw-fanctrl calibrate measure`: measure fan and thermal behaviour of this machine
+//! once and store the raw data. `fw-fanctrl calibrate apply` turns the stored data
+//! into a strategy for a chosen trade-off, instantly and as often as wanted.
 //!
-//! Phases:
+//! Measurement phases:
 //! 1. EC sensor names and thermal thresholds (read-only EC queries)
-//! 2. fan sweep: duty → RPM, and the duty at which the fan starts from standstill
+//! 2. fan: start duty from standstill, lowest running duty, duty → RPM
 //! 3. idle baseline per sensor
 //! 4. load step: which sensors react slowly (board) and which spike (CPU package)
-//! 5. sustained load at increasing fixed duties until the CPU no longer
-//!    throttles thermally; that duty and the board temperature it settles at are
-//!    the anchor of the curve
+//! 5. sustained load: full-fan reference, then increasing fixed duties until even
+//!    the strictest preference is satisfied (or a second full-fan reference)
+//! 6. idle comfort: fan speed needed to hold the board at 40, 43 and 46 °C
 //!
 //! The fan is always handed back to the EC afterwards (drop guard, signals, panic hook).
 
@@ -23,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -59,7 +61,9 @@ impl Prefer {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub const ALL: [Prefer; 3] = [Prefer::Quiet, Prefer::Balanced, Prefer::Cool];
+
+    pub fn name(self) -> &'static str {
         match self {
             Prefer::Quiet => "quiet",
             Prefer::Balanced => "balanced",
@@ -68,20 +72,56 @@ impl Prefer {
     }
 }
 
+pub const CALIBRATION_PATH: &str = "/etc/fw-fanctrl/calibration.json";
+
 #[derive(Debug, Clone, PartialEq)]
-pub struct Options {
-    pub prefer: Prefer,
+pub struct MeasureOptions {
     pub load_cmd: Option<String>,
-    pub apply: Option<String>,
-    pub config: PathBuf,
-    /// Keep the board sensors at about this temperature in idle / light use
-    /// (cooler surface), measured in an extra phase.
+    pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyOptions {
+    pub prefer: Prefer,
+    /// Keep the board sensors at about this temperature in idle / light use.
     pub comfort_temp: Option<f64>,
+    /// Strategy name; default `calibrated-<prefer>`.
+    pub name: Option<String>,
+    pub dry_run: bool,
+    pub config: PathBuf,
+    pub calibration: PathBuf,
+}
+
+/// Comfort targets measured by `calibrate measure` (°C, ascending).
+const COMFORT_TARGETS: [f64; 3] = [40.0, 43.0, 46.0];
+
+/// Everything `calibrate measure` found out; `calibrate apply` works from this alone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Calibration {
+    pub version: u32,
+    /// Unix time of the measurement.
+    pub measured_at: u64,
+    pub on_ac: Option<bool>,
+    pub load_cmd: Option<String>,
+    pub sensors: Vec<SensorInfo>,
+    pub board_sensors: Vec<usize>,
+    pub min_speed: u8,
+    /// (duty %, RPM)
+    pub fan_map: Vec<(u8, u16)>,
+    /// Max of the board sensors in idle at a low fan speed.
+    pub idle_temp: f64,
+    pub reference: Equilibrium,
+    pub end_reference: Option<Equilibrium>,
+    /// Increasing fixed duties under load, judged against `reference`.
+    pub steps: Vec<Equilibrium>,
+    /// (board temperature °C, duty % that holds it in idle), ascending temperature.
+    pub comfort: Vec<(f64, u8)>,
 }
 
 // ---------------------------------------------------------------- analysis (pure)
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensorInfo {
     pub index: usize,
     pub name: String,
@@ -144,7 +184,8 @@ pub fn settled(series: &[f64]) -> bool {
     (mean(&series[n - 20..]) - mean(&series[n - 60..n - 40])).abs() < 0.5
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Equilibrium {
     pub duty: u8,
     pub rpm: u16,
@@ -751,18 +792,25 @@ fn hold(
 }
 
 /// `pl1_max`: highest PL1 seen so far, to show when the platform lowered it.
-fn report(label: &str, eq: &Equilibrium, min_rel: f64, pl1_max: Option<f64>) {
+fn report(label: &str, eq: &Equilibrium, pl1_max: Option<f64>) {
     let na = || "n/a".to_string();
     let throttling =
         eq.throttle_ms.is_some_and(|ms| ms > 600) || eq.throttle_events.is_some_and(|n| n > 0);
     let verdict = if !label.is_empty() {
         label.to_string()
-    } else if eq.ok_for(min_rel) {
-        "ok".into()
     } else if throttling {
         "CPU throttling".into()
     } else {
-        format!("below {:.0} % performance", min_rel * 100.0)
+        let ok: Vec<&str> = Prefer::ALL
+            .iter()
+            .filter(|p| eq.ok_for(p.min_performance()))
+            .map(|p| p.name())
+            .collect();
+        if ok.is_empty() {
+            "below every preference".into()
+        } else {
+            format!("ok for {}", ok.join(", "))
+        }
     };
     let pl1 = match (eq.pl1_w, pl1_max) {
         (Some(p), Some(m)) if p + 0.5 < m => format!("{p:.0} W (lowered from {m:.0} W)"),
@@ -791,84 +839,76 @@ fn report(label: &str, eq: &Equilibrium, min_rel: f64, pl1_max: Option<f64>) {
     }
 }
 
-/// Idle (no load): cool down to `target` at full fan, then let a slow PI loop hold the
-/// board there for 4 minutes. The average duty of the last 2 minutes is what the
-/// curve needs at `target`. `None` if the target is not reachable in idle.
-fn comfort_hold(
-    ec: &CrosEc,
-    sampler: &Sampler,
-    board: &[usize],
-    target: f64,
-) -> Result<Option<(f64, u8)>> {
+/// Idle (no load): cool the board to the lowest target at full fan, then let a
+/// slow PI loop hold it at each target in turn (ascending, so each start is close).
+/// The average duty of the last 75 s per target is what the curve needs there.
+fn measure_comfort(ec: &CrosEc, sampler: &Sampler, board: &[usize]) -> Result<Vec<(f64, u8)>> {
     ec.send(EcCommand::SetFanDuty(100))?;
-    let mut reached = false;
+    let mut coolest = f64::MAX;
     for _ in 0..300 {
         let (row, _) = sampler.sample()?;
-        if max_of(&row, board).is_some_and(|(t, _)| t <= target + 0.5) {
-            reached = true;
-            break;
+        if let Some((t, _)) = max_of(&row, board) {
+            coolest = coolest.min(t);
+            if t <= COMFORT_TARGETS[0] + 0.5 {
+                break;
+            }
         }
-    }
-    if !reached {
-        eprintln!(
-            "  {target}°C is not reachable in idle even at full fan; ignoring --comfort-temp"
-        );
-        return Ok(None);
     }
     let (kp, ki) = (8.0, 0.1); // %/°C, %/(°C·s): slow, the board sensors lag
-    let mut integral = 20.0;
+    let mut integral = 30.0;
     let mut current = 100u8;
-    let (mut duties, mut temps) = (Vec::new(), Vec::new());
-    for _ in 0..240 {
-        let (row, _) = sampler.sample()?;
-        let Some((t, _)) = max_of(&row, board) else {
+    let mut out = Vec::new();
+    for target in COMFORT_TARGETS {
+        if target < coolest - 0.5 {
+            eprintln!("  {target}°C: not reachable in idle even at full fan");
             continue;
-        };
-        let err = t - target;
-        integral = (integral + ki * err).clamp(0.0, 100.0);
-        let duty = (kp * err + integral).clamp(0.0, 100.0).round() as u8;
-        if duty != current {
-            ec.send(EcCommand::SetFanDuty(duty))?;
-            current = duty;
         }
-        duties.push(duty as f64);
-        temps.push(t);
+        if out.last().is_some_and(|&(_, d): &(f64, u8)| d == 0) {
+            eprintln!("  {target}°C: needs no fan");
+            out.push((target, 0));
+            continue;
+        }
+        let (mut duties, mut temps) = (Vec::new(), Vec::new());
+        for _ in 0..150 {
+            let (row, _) = sampler.sample()?;
+            let Some((t, _)) = max_of(&row, board) else {
+                continue;
+            };
+            let err = t - target;
+            integral = (integral + ki * err).clamp(0.0, 100.0);
+            let duty = (kp * err + integral).clamp(0.0, 100.0).round() as u8;
+            if duty != current {
+                ec.send(EcCommand::SetFanDuty(duty))?;
+                current = duty;
+            }
+            duties.push(duty as f64);
+            temps.push(t);
+        }
+        if duties.len() < 75 {
+            bail!("comfort phase: too few board readings");
+        }
+        let n = duties.len();
+        let duty = mean(&duties[n - 75..]).ceil() as u8;
+        eprintln!(
+            "  {target}°C: held {:.1}°C with about {duty}% ({} RPM)",
+            mean(&temps[n - 75..]),
+            rpm(ec)
+        );
+        out.push((target, duty));
     }
-    if duties.len() < 120 {
-        bail!("comfort phase: too few board readings");
-    }
-    let n = duties.len();
-    let duty = mean(&duties[n - 120..]).ceil() as u8;
-    eprintln!(
-        "  holding {:.1}°C needs about {duty}% ({} RPM)",
-        mean(&temps[n - 120..]),
-        rpm(ec)
-    );
-    Ok(Some((target, duty)))
+    Ok(out)
 }
 
-pub fn run(opts: &Options) -> Result<()> {
-    // Everything that can be checked up front is checked before 10-20 minutes of load.
-    if let Some(name) = &opts.apply {
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            bail!("invalid strategy name '{name}' (allowed: a-z, A-Z, 0-9, _ and -)");
-        }
-        let cfg = Config::load(&opts.config)?;
-        if cfg.strategy(name).is_some() {
-            eprintln!(
-                "[Warning] > strategy '{name}' exists in {} and will be replaced (a backup is kept)",
-                opts.config.display()
-            );
-        }
-    }
+pub fn measure(opts: &MeasureOptions) -> Result<()> {
     if let Some(c) = &opts.load_cmd {
         split_load_cmd(c)?;
     }
-
+    if let Some(dir) = opts.output.parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.exists()
+    {
+        bail!("output directory {} does not exist", dir.display());
+    }
     let ec = CrosEc::open()?;
     signals::install();
     let service_paused = match pause_service() {
@@ -880,24 +920,32 @@ pub fn run(opts: &Options) -> Result<()> {
         Err(_) => false, // no service running
     };
     if service_paused {
-        eprintln!("fw-fanctrl service paused for the calibration (lease {LEASE_SECS} s, renewed)");
+        eprintln!("fw-fanctrl service paused for the measurement (lease {LEASE_SECS} s, renewed)");
     }
-    let result = measure(&ec, opts, service_paused);
+    let result = run_measurement(&ec, opts, service_paused);
     if service_paused {
-        if let (Ok(_), Some(_)) = (&result, &opts.apply) {
-            let _ = daemon::send_command(&["reload".to_string()]);
-        }
         let _ = daemon::send_command(&["resume".to_string()]);
         eprintln!("fw-fanctrl service resumed");
     }
-    result
+    let cal = result?;
+    write_json(&opts.output, &serde_json::to_value(&cal)?)?;
+    print_summary(&cal);
+    eprintln!(
+        "\nsaved to {}\ncreate a strategy with: fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C]",
+        opts.output.display()
+    );
+    Ok(())
 }
 
-fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
+fn run_measurement(
+    ec: &CrosEc,
+    opts: &MeasureOptions,
+    service_paused: bool,
+) -> Result<Calibration> {
     let mut guard = Guard { ec, load: None };
     let started = Instant::now();
-    let total = if opts.comfort_temp.is_some() { 6 } else { 5 };
-    let step = |n: u8, what: &str| eprintln!("\n[{n}/{total}] {what}");
+    let step = |n: u8, what: &str| eprintln!("\n[{n}/6] {what}");
+    let on_ac = ec.on_ac().ok();
 
     // 1. sensors
     step(1, "reading EC sensor information");
@@ -983,10 +1031,12 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     map_duties.retain(|d| *d >= min_speed);
     map_duties.sort_unstable();
     map_duties.dedup();
+    let mut fan_map = Vec::new();
     for duty in map_duties {
         ec.send(EcCommand::SetFanDuty(duty))?;
         let r = stable_rpm(ec, &sampler)?;
         eprintln!("  {duty:>3}% → {r} RPM");
+        fan_map.push((duty, r));
     }
 
     // 3. idle baseline
@@ -1049,7 +1099,8 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         board
     };
 
-    // 5. reference at full fan, then increasing duties under the same load
+    // 5. reference at full fan, then increasing duties under the same load until
+    //    even the strictest preference is satisfied
     step(
         5,
         "sustained load: reference at 100 % fan, then increasing fan speeds (up to 4 min each)",
@@ -1058,76 +1109,48 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         board: &board,
         spiky: &spiky,
     };
-    let min_rel = opts.prefer.min_performance();
-    eprintln!(
-        "  prefer {}: a fan speed must reach {:.0} % of the full-fan performance without CPU throttling",
-        opts.prefer.name(),
-        min_rel * 100.0
-    );
+    let strictest = Prefer::Cool.min_performance();
     let mut reference = hold(ec, &sampler, &groups, 100, None)?;
     reference.ref_mhz = reference.mhz;
     let mut pl1_max = reference.pl1_w;
-    report("reference", &reference, min_rel, pl1_max);
+    report("reference", &reference, pl1_max);
     let mut duties: Vec<u8> = vec![min_speed, 20, 30, 40, 55, 65, 75, 85];
     duties.retain(|d| *d >= min_speed && *d < 100);
     duties.sort_unstable();
     duties.dedup();
-    let mut results = Vec::new();
-    let mut anchor = None;
+    let mut steps = Vec::new();
+    let mut strictest_met = false;
     for duty in duties {
         let eq = hold(ec, &sampler, &groups, duty, reference.mhz)?;
         pl1_max = max_opt(pl1_max, eq.pl1_w);
-        report("", &eq, min_rel, pl1_max);
-        let ok = eq.ok_for(min_rel);
-        results.push(eq);
-        if ok {
-            anchor = results.last().cloned();
+        report("", &eq, pl1_max);
+        strictest_met = eq.ok_for(strictest);
+        steps.push(eq);
+        if strictest_met {
             break;
         }
     }
-    let anchor = match anchor {
-        Some(a) => a,
-        None => {
-            // Nothing reached the first reference. Measure full fan again after the
-            // same soak time: if the CPU is slower now too, the first reference was
-            // inflated (time-dependent power budget), and the steps are judged again
-            // against this fair one.
-            let mut end = hold(ec, &sampler, &groups, 100, None)?;
-            end.ref_mhz = end.mhz;
-            pl1_max = max_opt(pl1_max, end.pl1_w);
-            report("reference (end)", &end, min_rel, pl1_max);
-            match pick_anchor(&results, end.mhz, min_rel) {
-                Some(a) => {
-                    eprintln!(
-                        "  judged against the end reference: {}% is the quietest acceptable speed",
-                        a.duty
-                    );
-                    a
-                }
-                None => {
-                    eprintln!(
-                        "  note: only full fan speed reaches the required performance; the curve tops out there"
-                    );
-                    end
-                }
-            }
-        }
+    // Not all preferences answered: measure full fan again after the same soak
+    // time. Time-dependent power budgets can make the first reference unfairly fast.
+    let end_reference = if strictest_met {
+        None
+    } else {
+        let mut end = hold(ec, &sampler, &groups, 100, None)?;
+        end.ref_mhz = end.mhz;
+        pl1_max = max_opt(pl1_max, end.pl1_w);
+        report("reference (end)", &end, pl1_max);
+        Some(end)
     };
     if let Some(load) = guard.load.take() {
         load.stop();
     }
 
-    // 6. optional: idle comfort
-    let comfort = match opts.comfort_temp {
-        Some(t) => {
-            step(
-                6,
-                &format!("idle comfort: which fan speed holds the board at {t}°C (up to 9 min)"),
-            );
-            comfort_hold(ec, &sampler, &board, t)?
-        }
-        None => None,
-    };
+    // 6. idle comfort
+    step(
+        6,
+        "idle comfort: fan speed that holds the board at 40, 43 and 46 °C (up to 13 min)",
+    );
+    let comfort = measure_comfort(ec, &sampler, &board)?;
     drop(guard); // EC auto
 
     let idle_temp = board
@@ -1135,46 +1158,231 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         .map(|&i| mean(&column(&idle_rows, i)))
         .reduce(f64::max)
         .unwrap_or(40.0);
-    let input = CurveInput {
-        idle_temp,
-        min_speed,
-        dominant_thresholds: infos
-            .iter()
-            .find(|i| i.index == anchor.dominant)
-            .and_then(|i| i.thresholds),
-        anchor,
-        sensors: board,
-        comfort,
-    };
-    let strategy = build_strategy(&input, opts.prefer);
-
     eprintln!(
-        "\ncalibration finished in {:.0} min (prefer: {})",
-        started.elapsed().as_secs_f64() / 60.0,
-        opts.prefer.name()
+        "\nmeasurement finished in {:.0} min",
+        started.elapsed().as_secs_f64() / 60.0
     );
-    println!("{}", serde_json::to_string_pretty(&strategy)?);
+    Ok(Calibration {
+        version: 1,
+        measured_at: now_secs(),
+        on_ac,
+        load_cmd: opts.load_cmd.clone(),
+        sensors: infos,
+        board_sensors: board,
+        min_speed,
+        fan_map,
+        idle_temp,
+        reference,
+        end_reference,
+        steps,
+        comfort,
+    })
+}
 
-    if let Some(name) = &opts.apply {
-        apply(&opts.config, name, &strategy)?;
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+impl Calibration {
+    /// Quietest step acceptable for `prefer`: judged against the first reference,
+    /// then against the end reference; full fan if none passes.
+    pub fn anchor(&self, prefer: Prefer) -> Equilibrium {
+        let min = prefer.min_performance();
+        pick_anchor(&self.steps, self.reference.mhz, min)
+            .or_else(|| {
+                self.end_reference
+                    .as_ref()
+                    .and_then(|e| pick_anchor(&self.steps, e.mhz, min))
+            })
+            .unwrap_or_else(|| {
+                self.end_reference
+                    .clone()
+                    .unwrap_or_else(|| self.reference.clone())
+            })
+    }
+
+    /// Duty that holds the board at `t` in idle, interpolated between the measured
+    /// targets. Outside the measured range the nearest point is used (and said so).
+    pub fn comfort_duty(&self, t: f64) -> Option<(u8, Option<String>)> {
+        let pts = &self.comfort;
+        let (first, last) = (pts.first()?, pts.last()?);
+        if t <= first.0 {
+            let note = (t < first.0).then(|| {
+                format!(
+                    "{t}°C is below the measured range; using {}% from {}°C (it may need more)",
+                    first.1, first.0
+                )
+            });
+            return Some((first.1, note));
+        }
+        if t >= last.0 {
+            let note = (t > last.0).then(|| {
+                format!(
+                    "{t}°C is above the measured range; using {}% from {}°C",
+                    last.1, last.0
+                )
+            });
+            return Some((last.1, note));
+        }
+        let w = pts.windows(2).find(|w| t >= w[0].0 && t <= w[1].0)?;
+        let (a, b) = (w[0], w[1]);
+        let duty = a.1 as f64 + (t - a.0) / (b.0 - a.0) * (b.1 as f64 - a.1 as f64);
+        Some((duty.round() as u8, None))
+    }
+
+    pub fn curve_input(&self, prefer: Prefer, comfort_temp: Option<f64>) -> Result<CurveInput> {
+        let anchor = self.anchor(prefer);
+        let comfort = match comfort_temp {
+            None => None,
+            Some(t) => match self.comfort_duty(t) {
+                Some((duty, note)) => {
+                    if let Some(n) = note {
+                        eprintln!("[Warning] > {n}");
+                    }
+                    Some((t, duty))
+                }
+                None => bail!("the calibration has no comfort measurements"),
+            },
+        };
+        Ok(CurveInput {
+            idle_temp: self.idle_temp,
+            min_speed: self.min_speed,
+            dominant_thresholds: self
+                .sensors
+                .iter()
+                .find(|i| i.index == anchor.dominant)
+                .and_then(|i| i.thresholds),
+            anchor,
+            sensors: self.board_sensors.clone(),
+            comfort,
+        })
+    }
+}
+
+fn print_summary(cal: &Calibration) {
+    let rpm_at = |duty: u8| {
+        cal.fan_map
+            .iter()
+            .min_by_key(|(d, _)| d.abs_diff(duty))
+            .map_or(0, |(_, r)| *r)
+    };
+    eprintln!("\nsummary:");
+    for p in Prefer::ALL {
+        let a = cal.anchor(p);
+        eprintln!(
+            "  {:<9} ({:.0} % performance): {:>3}% fan (~{} RPM), board {:.1}°C",
+            p.name(),
+            p.min_performance() * 100.0,
+            a.duty,
+            rpm_at(a.duty),
+            a.board_temp
+        );
+    }
+    for (t, d) in &cal.comfort {
+        eprintln!("  comfort {t}°C: {d}% fan in idle (~{} RPM)", rpm_at(*d));
+    }
+}
+
+fn write_json(path: &Path, v: &Value) -> Result<()> {
+    let mut buf = serde_json::to_vec_pretty(v)?;
+    buf.push(b'\n');
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &buf)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp);
+        return Err(Error(format!("cannot write {}: {e}", path.display())));
     }
     Ok(())
 }
 
-fn apply(path: &Path, name: &str, strategy: &Value) -> Result<()> {
-    let raw = fs::read_to_string(path)?;
-    let merged = merge_strategy(&raw, name, strategy)?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let backup = path.with_extension(format!("json.bak-{stamp}"));
-    fs::copy(path, &backup)?;
-    Config::parse(&merged)?.save(path)?;
+pub fn load_calibration(path: &Path) -> Result<Calibration> {
+    let raw = fs::read_to_string(path).map_err(|e| {
+        Error(format!(
+            "cannot read {}: {e} (run 'fw-fanctrl calibrate measure' first)",
+            path.display()
+        ))
+    })?;
+    let cal: Calibration = serde_json::from_str(&raw)
+        .map_err(|e| Error(format!("invalid calibration file {}: {e}", path.display())))?;
+    if cal.version != 1 {
+        bail!(
+            "unsupported calibration version {} in {}",
+            cal.version,
+            path.display()
+        );
+    }
+    Ok(cal)
+}
+
+pub fn apply(opts: &ApplyOptions) -> Result<()> {
+    let name = opts
+        .name
+        .clone()
+        .unwrap_or_else(|| format!("calibrated-{}", opts.prefer.name()));
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!("invalid strategy name '{name}' (allowed: a-z, A-Z, 0-9, _ and -)");
+    }
+    let cal = load_calibration(&opts.calibration)?;
+    let days = now_secs().saturating_sub(cal.measured_at) / 86_400;
     eprintln!(
-        "saved as strategy '{name}' in {} (backup: {})\nactivate with: fw-fanctrl use {name}   (or set \"defaultStrategy\": \"{name}\")",
-        path.display(),
+        "calibration from {} day(s) ago{}",
+        days,
+        match cal.on_ac {
+            Some(false) => " (measured on battery)",
+            _ => "",
+        }
+    );
+    if days > 90 {
+        eprintln!(
+            "[Warning] > the calibration is old; consider measuring again (ambient temperature matters)"
+        );
+    }
+    let input = cal.curve_input(opts.prefer, opts.comfort_temp)?;
+    eprintln!(
+        "prefer {}: anchor {}% at board {:.1}°C{}",
+        opts.prefer.name(),
+        input.anchor.duty,
+        input.anchor.board_temp,
+        input
+            .comfort
+            .map_or(String::new(), |(t, d)| format!(", comfort {t}°C → {d}%"))
+    );
+    let strategy = build_strategy(&input, opts.prefer);
+    println!("{}", serde_json::to_string_pretty(&strategy)?);
+    if opts.dry_run {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&opts.config)
+        .map_err(|e| Error(format!("cannot read {}: {e}", opts.config.display())))?;
+    let existed = Config::parse(&raw)?.strategy(&name).is_some();
+    let merged = merge_strategy(&raw, &name, &strategy)?;
+    let backup = opts
+        .config
+        .with_extension(format!("json.bak-{}", now_secs()));
+    fs::copy(&opts.config, &backup)?;
+    Config::parse(&merged)?.save(&opts.config)?;
+    eprintln!(
+        "{} strategy '{name}' in {} (backup: {})",
+        if existed { "replaced" } else { "added" },
+        opts.config.display(),
         backup.display()
     );
+    if daemon::send_command(&["reload".to_string()]).is_ok() {
+        eprintln!("service reloaded");
+    }
+    eprintln!("activate with: fw-fanctrl use {name}   (or set \"defaultStrategy\": \"{name}\")");
     Ok(())
 }
 
@@ -1441,6 +1649,126 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         stop.store(true, Ordering::Relaxed);
         h.join().unwrap();
+    }
+
+    fn stored() -> Calibration {
+        // values from the Framework 13 Pro runs
+        let step = |duty, mhz, throttle_ms, board| Equilibrium {
+            mhz: Some(mhz),
+            ref_mhz: Some(2632.0),
+            throttle_ms: Some(throttle_ms),
+            ..eq(duty, board)
+        };
+        Calibration {
+            version: 1,
+            measured_at: now_secs(),
+            on_ac: Some(true),
+            load_cmd: None,
+            sensors: vec![SensorInfo {
+                index: 1,
+                name: "cpu_f75303@4d".into(),
+                thresholds: Some(Thresholds {
+                    high: Some(88),
+                    fan_off: Some(40),
+                    fan_max: Some(78),
+                    ..Default::default()
+                }),
+            }],
+            board_sensors: vec![0, 1],
+            min_speed: 10,
+            fan_map: vec![(10, 920), (20, 1989), (40, 3561), (60, 4772), (100, 6687)],
+            idle_temp: 41.0,
+            reference: Equilibrium {
+                mhz: Some(2632.0),
+                ref_mhz: Some(2632.0),
+                ..eq(100, 62.0)
+            },
+            end_reference: Some(Equilibrium {
+                mhz: Some(2620.0),
+                ref_mhz: Some(2620.0),
+                ..eq(100, 62.5)
+            }),
+            steps: vec![
+                step(10, 2165.0, 31_501, 70.2),
+                step(20, 2321.0, 49_001, 72.0),
+                step(30, 2356.0, 32_245, 73.0),
+                step(40, 2405.0, 0, 72.0),
+                step(55, 2435.0, 0, 68.8),
+                step(65, 2450.0, 0, 67.0),
+                step(75, 2465.0, 0, 65.9),
+                step(85, 2480.0, 0, 64.0),
+            ],
+            comfort: vec![(40.0, 36), (43.0, 18), (46.0, 0)],
+        }
+    }
+
+    #[test]
+    fn stored_calibration_roundtrip_and_anchors() {
+        let cal = stored();
+        let json = serde_json::to_string(&cal).unwrap();
+        assert_eq!(serde_json::from_str::<Calibration>(&json).unwrap(), cal);
+        assert_eq!(cal.anchor(Prefer::Quiet).duty, 40);
+        assert_eq!(cal.anchor(Prefer::Balanced).duty, 55);
+        assert_eq!(cal.anchor(Prefer::Cool).duty, 100); // end reference is still fast
+    }
+
+    #[test]
+    fn comfort_interpolation() {
+        let cal = stored();
+        assert_eq!(cal.comfort_duty(40.0), Some((36, None)));
+        assert_eq!(cal.comfort_duty(41.5).unwrap().0, 27);
+        assert_eq!(cal.comfort_duty(44.5).unwrap().0, 9);
+        let (d, note) = cal.comfort_duty(38.0).unwrap();
+        assert_eq!(d, 36);
+        assert!(note.unwrap().contains("below the measured range"));
+        assert_eq!(cal.comfort_duty(50.0).unwrap().0, 0);
+        let mut none = stored();
+        none.comfort.clear();
+        assert!(none.curve_input(Prefer::Quiet, Some(43.0)).is_err());
+    }
+
+    #[test]
+    fn apply_writes_strategy_with_backup() {
+        let dir = std::env::temp_dir().join(format!("fwfan-apply-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        let calibration = dir.join("calibration.json");
+        fs::write(&config, include_str!("../tests/upstream_config.json")).unwrap();
+        write_json(&calibration, &serde_json::to_value(stored()).unwrap()).unwrap();
+        let opts = |dry_run| ApplyOptions {
+            prefer: Prefer::Quiet,
+            comfort_temp: Some(43.0),
+            name: None,
+            dry_run,
+            config: config.clone(),
+            calibration: calibration.clone(),
+        };
+        apply(&opts(true)).unwrap();
+        assert!(
+            Config::load(&config)
+                .unwrap()
+                .strategy("calibrated-quiet")
+                .is_none()
+        );
+        apply(&opts(false)).unwrap();
+        let c = Config::load(&config).unwrap();
+        let s = c.strategy("calibrated-quiet").unwrap();
+        assert_eq!(s.ramp.min_speed, Some(10));
+        assert_eq!(s.sensors, Some(vec![0, 1]));
+        assert_eq!(s.target_speed(43.0), 18); // comfort point
+        assert!(c.strategy("lazy").is_some());
+        let backups = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".bak-")
+            })
+            .count();
+        assert_eq!(backups, 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
