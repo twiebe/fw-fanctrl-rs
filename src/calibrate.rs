@@ -62,6 +62,9 @@ pub struct Options {
     pub load_cmd: Option<String>,
     pub apply: Option<String>,
     pub config: PathBuf,
+    /// Keep the board sensors at about this temperature in idle / light use
+    /// (cooler surface), measured in an extra phase.
+    pub comfort_temp: Option<f64>,
 }
 
 // ---------------------------------------------------------------- analysis (pure)
@@ -147,7 +150,10 @@ pub struct Equilibrium {
     /// Package power over the last 20 s and the long-term limit (RAPL PL1).
     pub package_w: Option<f64>,
     pub pl1_w: Option<f64>,
+    /// Average CPU frequency over the last 20 s.
     pub mhz: Option<f64>,
+    /// Frequency of the reference run at 100 % fan under the same load.
+    pub ref_mhz: Option<f64>,
     /// A sensor came within 2 °C of its EC "high" threshold.
     pub guard_hit: bool,
 }
@@ -158,20 +164,37 @@ impl Equilibrium {
         matches!((self.package_w, self.pl1_w), (Some(p), Some(l)) if l > 0.0 && p >= 0.9 * l)
     }
 
-    /// No thermal throttling at this duty. All kernel signals are weak on their own
-    /// (both throttle counters only advance when an episode starts or ends, so a CPU
-    /// held at TjMax for the whole window can show no change), so they are combined:
-    /// any of them counts as throttling.
+    /// Frequency relative to the reference run, if both are known.
+    pub fn relative_mhz(&self) -> Option<f64> {
+        match (self.mhz, self.ref_mhz) {
+            (Some(m), Some(r)) if r > 0.0 => Some(m / r),
+            _ => None,
+        }
+    }
+
+    /// The CPU is not thermally limited at this duty.
+    ///
+    /// The decisive signal is performance: thermal limiting costs frequency, so the
+    /// CPU must reach at least 95 % of the frequency it achieves at 100 % fan under
+    /// the same load. Kernel throttle counters veto on top (they only advance at
+    /// episode boundaries, so they cannot prove the absence of throttling). Without
+    /// a frequency reading, a package near TjMax below PL1 counts as limited.
     pub fn ok(&self) -> bool {
         if self.guard_hit {
             return false;
         }
-        // A package near TjMax while drawing less than PL1 is held back by temperature.
-        let hot = self.spiky_max.is_some_and(|t| t >= 90.0);
-        let throttled = self.throttle_ms.is_some_and(|ms| ms > 600)
+        if self.throttle_ms.is_some_and(|ms| ms > 600)
             || self.throttle_events.is_some_and(|n| n > 0)
-            || (hot && !self.power_limited());
-        !throttled
+        {
+            return false;
+        }
+        match self.relative_mhz() {
+            Some(rel) => rel >= 0.95,
+            None => {
+                let hot = self.spiky_max.is_some_and(|t| t >= 90.0);
+                !(hot && !self.power_limited())
+            }
+        }
     }
 }
 
@@ -184,6 +207,8 @@ pub struct CurveInput {
     /// EC thresholds of the dominant sensor.
     pub dominant_thresholds: Option<Thresholds>,
     pub sensors: Vec<usize>,
+    /// (temperature, duty that holds the board there in idle)
+    pub comfort: Option<(f64, u8)>,
 }
 
 /// Build the strategy JSON. Shape: off until shortly above idle, gentle rise to the
@@ -215,16 +240,26 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
         t.max(fan_max_t).min(100.0)
     };
 
-    let mut off_t = (idle + on_offset).min(anchor_t - 4.0);
-    off_t = off_t.max(1.0);
-    let on_t = (off_t + 2.0).min(anchor_t - 1.0);
     let mid_t = ((anchor_t + fan_max_t) / 2.0).round();
     let mid_speed = anchor_duty + (100 - anchor_duty) / 3;
 
+    // Fan-on: either just above idle, or around the comfort temperature, where the
+    // curve gives the duty that was measured to hold the board there.
+    let (off_t, on_t, on_speed) = match c.comfort {
+        Some((t, duty)) if t.round() <= anchor_t - 3.0 => {
+            let t = t.round();
+            (t - 2.0, t, duty.max(floor).min(anchor_duty))
+        }
+        _ => {
+            let off_t = (idle + on_offset).min(anchor_t - 4.0).max(1.0);
+            (off_t, (off_t + 2.0).min(anchor_t - 1.0), floor)
+        }
+    };
+
     let candidates = [
         (0.0, 0),
-        (off_t, 0),
-        (on_t, floor),
+        (off_t.max(1.0), 0),
+        (on_t, on_speed),
         (anchor_t, anchor_duty),
         (mid_t, mid_speed),
         (fan_max_t, 100),
@@ -295,17 +330,7 @@ impl Load {
         let threads = (0..n)
             .map(|i| {
                 let stop = Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    let mut x = i as u64 + 1;
-                    while !stop.load(Ordering::Relaxed) {
-                        for _ in 0..100_000 {
-                            x = black_box(
-                                x.wrapping_mul(6364136223846793005)
-                                    .wrapping_add(1442695040888963407),
-                            );
-                        }
-                    }
-                })
+                std::thread::spawn(move || burn(&stop, i as u64))
             })
             .collect();
         let child = match cmd {
@@ -358,6 +383,53 @@ impl Load {
     }
 }
 
+/// Busy loop for one CPU. Uses 256-bit FMA when available, which draws
+/// considerably more power than integer code (closer to stress-ng, games and
+/// compilers), so the calibration errs on the warm side.
+fn burn(stop: &AtomicBool, seed: u64) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the required CPU features were detected at runtime.
+        unsafe { burn_avx2_fma(stop) };
+        return;
+    }
+    burn_scalar(stop, seed);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+fn burn_avx2_fma(stop: &AtomicBool) {
+    use std::arch::x86_64::{__m256d, _mm256_fmadd_pd, _mm256_set1_pd};
+    let a = _mm256_set1_pd(0.999_999);
+    let b = _mm256_set1_pd(1e-7);
+    // 10 independent chains keep both FMA ports busy despite the 4-cycle latency
+    let mut acc: [__m256d; 10] = [_mm256_set1_pd(1.0); 10];
+    while !stop.load(Ordering::Relaxed) {
+        for _ in 0..20_000 {
+            for v in acc.iter_mut() {
+                *v = _mm256_fmadd_pd(*v, a, b);
+            }
+        }
+        acc = black_box(acc);
+    }
+}
+
+fn burn_scalar(stop: &AtomicBool, seed: u64) {
+    let mut x = seed + 1;
+    let mut f = [1.0f64; 8];
+    while !stop.load(Ordering::Relaxed) {
+        for _ in 0..20_000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            for v in f.iter_mut() {
+                *v = v.mul_add(0.999_999, 1e-7);
+            }
+        }
+        black_box((x, f));
+    }
+}
+
 fn read_u64(path: &str) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -371,6 +443,7 @@ struct CpuSample {
     throttle_ms: Option<u64>,
     throttle_count: Option<u64>,
     energy_uj: Option<u64>,
+    mhz: Option<f64>,
 }
 
 impl CpuSample {
@@ -380,6 +453,7 @@ impl CpuSample {
             throttle_ms: read_u64(&format!("{THROTTLE_DIR}/package_throttle_total_time_ms")),
             throttle_count: read_u64(&format!("{THROTTLE_DIR}/package_throttle_count")),
             energy_uj: read_u64(&format!("{RAPL_DIR}/energy_uj")),
+            mhz: avg_mhz(),
         }
     }
 }
@@ -495,6 +569,158 @@ fn max_of(row: &[Option<f64>], idx: &[usize]) -> Option<(f64, usize)> {
         .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
+struct Groups<'a> {
+    board: &'a [usize],
+    spiky: &'a [usize],
+}
+
+/// Run at a fixed duty under the current load until the board temperature settles
+/// (90 s .. 4 min) and summarize the last part.
+fn hold(
+    ec: &CrosEc,
+    sampler: &Sampler,
+    g: &Groups,
+    duty: u8,
+    ref_mhz: Option<f64>,
+) -> Result<Equilibrium> {
+    ec.send(EcCommand::SetFanDuty(duty))?;
+    let mut board_series = Vec::new();
+    let mut rows = Vec::new();
+    let mut cpu = Vec::new();
+    let mut guard_hit = false;
+    for s in 0..240 {
+        let (row, hit) = sampler.sample()?;
+        cpu.push(CpuSample::now());
+        if let Some((t, _)) = max_of(&row, g.board) {
+            board_series.push(t);
+        }
+        rows.push(row);
+        if hit {
+            guard_hit = true;
+            break;
+        }
+        if s >= 90 && settled(&board_series) {
+            break;
+        }
+    }
+    let last = &rows[rows.len().saturating_sub(20)..];
+    let (board_temp, dominant) = g
+        .board
+        .iter()
+        .map(|&i| (mean(&column(last, i)), i))
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .unwrap_or((0.0, g.board[0]));
+    let spiky_max = g
+        .spiky
+        .iter()
+        .filter_map(|&i| column(last, i).into_iter().reduce(f64::max))
+        .reduce(f64::max);
+    let (w60, w20) = (
+        &cpu[cpu.len().saturating_sub(60)..],
+        &cpu[cpu.len().saturating_sub(20)..],
+    );
+    let (first, last_s) = (w60[0], w60[w60.len() - 1]);
+    let mhz: Vec<f64> = w20.iter().filter_map(|c| c.mhz).collect();
+    Ok(Equilibrium {
+        duty,
+        rpm: rpm(ec),
+        board_temp,
+        dominant,
+        spiky_max,
+        throttle_ms: delta(first.throttle_ms, last_s.throttle_ms),
+        throttle_events: delta(first.throttle_count, last_s.throttle_count),
+        package_w: watts(&w20[0], &w20[w20.len() - 1]),
+        pl1_w: pl1_watts(),
+        mhz: (!mhz.is_empty()).then(|| mean(&mhz)),
+        ref_mhz,
+        guard_hit,
+    })
+}
+
+fn report(label: &str, eq: &Equilibrium) {
+    let na = || "n/a".to_string();
+    let verdict = if label.is_empty() {
+        if eq.ok() { "ok" } else { "thermally limited" }
+    } else {
+        label
+    };
+    eprintln!(
+        "  {:>3}% ({} RPM): board {:.1}°C (sensor {}), package {}, {} ({}), throttled {} ms/60 s ({} events), {} of PL1 {} → {}",
+        eq.duty,
+        eq.rpm,
+        eq.board_temp,
+        eq.dominant,
+        eq.spiky_max.map_or("-".into(), |t| format!("{t:.0}°C")),
+        eq.mhz.map_or("-".into(), |m| format!("{m:.0} MHz")),
+        eq.relative_mhz()
+            .map_or("-".into(), |r| format!("{:.0} % of reference", r * 100.0)),
+        eq.throttle_ms.map_or_else(na, |n| n.to_string()),
+        eq.throttle_events.map_or_else(na, |n| n.to_string()),
+        eq.package_w.map_or_else(na, |w| format!("{w:.1} W")),
+        eq.pl1_w.map_or_else(na, |w| format!("{w:.0} W")),
+        verdict
+    );
+    if label == "reference" && !eq.ok() {
+        eprintln!("  note: the CPU is thermally limited even at full fan speed");
+    }
+}
+
+/// Idle (no load): cool down to `target` at full fan, then let a slow PI loop hold the
+/// board there for 4 minutes. The average duty of the last 2 minutes is what the
+/// curve needs at `target`. `None` if the target is not reachable in idle.
+fn comfort_hold(
+    ec: &CrosEc,
+    sampler: &Sampler,
+    board: &[usize],
+    target: f64,
+) -> Result<Option<(f64, u8)>> {
+    ec.send(EcCommand::SetFanDuty(100))?;
+    let mut reached = false;
+    for _ in 0..300 {
+        let (row, _) = sampler.sample()?;
+        if max_of(&row, board).is_some_and(|(t, _)| t <= target + 0.5) {
+            reached = true;
+            break;
+        }
+    }
+    if !reached {
+        eprintln!(
+            "  {target}°C is not reachable in idle even at full fan; ignoring --comfort-temp"
+        );
+        return Ok(None);
+    }
+    let (kp, ki) = (8.0, 0.1); // %/°C, %/(°C·s): slow, the board sensors lag
+    let mut integral = 20.0;
+    let mut current = 100u8;
+    let (mut duties, mut temps) = (Vec::new(), Vec::new());
+    for _ in 0..240 {
+        let (row, _) = sampler.sample()?;
+        let Some((t, _)) = max_of(&row, board) else {
+            continue;
+        };
+        let err = t - target;
+        integral = (integral + ki * err).clamp(0.0, 100.0);
+        let duty = (kp * err + integral).clamp(0.0, 100.0).round() as u8;
+        if duty != current {
+            ec.send(EcCommand::SetFanDuty(duty))?;
+            current = duty;
+        }
+        duties.push(duty as f64);
+        temps.push(t);
+    }
+    if duties.len() < 120 {
+        bail!("comfort phase: too few board readings");
+    }
+    let n = duties.len();
+    let duty = mean(&duties[n - 120..]).ceil() as u8;
+    eprintln!(
+        "  holding {:.1}°C needs about {duty}% ({} RPM)",
+        mean(&temps[n - 120..]),
+        rpm(ec)
+    );
+    Ok(Some((target, duty)))
+}
+
 pub fn run(opts: &Options) -> Result<()> {
     // Everything that can be checked up front is checked before 10-20 minutes of load.
     if let Some(name) = &opts.apply {
@@ -544,7 +770,8 @@ pub fn run(opts: &Options) -> Result<()> {
 fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     let mut guard = Guard { ec, load: None };
     let started = Instant::now();
-    let step = |n: u8, what: &str| eprintln!("\n[{n}/5] {what}");
+    let total = if opts.comfort_temp.is_some() { 6 } else { 5 };
+    let step = |n: u8, what: &str| eprintln!("\n[{n}/{total}] {what}");
 
     // 1. sensors
     step(1, "reading EC sensor information");
@@ -677,100 +904,57 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         board
     };
 
-    // 5. sustained load at increasing duties
-    step(5, "sustained load at fixed fan speeds (up to 4 min each)");
-    let mut results: Vec<Equilibrium> = Vec::new();
-    let duties: Vec<u8> = [20u8, 30, 40, 55, 75, 100]
-        .into_iter()
-        .filter(|d| *d >= start_duty)
-        .collect();
+    // 5. reference at full fan, then increasing duties under the same load
+    step(
+        5,
+        "sustained load: reference at 100 % fan, then increasing fan speeds (up to 4 min each)",
+    );
+    let groups = Groups {
+        board: &board,
+        spiky: &spiky,
+    };
+    let mut reference = hold(ec, &sampler, &groups, 100, None)?;
+    reference.ref_mhz = reference.mhz;
+    report("reference", &reference);
+    let mut duties: Vec<u8> = vec![start_duty, 20, 30, 40, 55, 75];
+    duties.retain(|d| *d >= start_duty && *d < 100);
+    duties.sort_unstable();
+    duties.dedup();
+    let mut anchor = None;
     for duty in duties {
-        ec.send(EcCommand::SetFanDuty(duty))?;
-        let mut board_series = Vec::new();
-        let mut rows = Vec::new();
-        let mut cpu = Vec::new();
-        let mut guard_hit = false;
-        for s in 0..240 {
-            let (row, hit) = sampler.sample()?;
-            cpu.push(CpuSample::now());
-            if let Some((t, _)) = max_of(&row, &board) {
-                board_series.push(t);
-            }
-            rows.push(row);
-            if hit {
-                guard_hit = true;
-                break;
-            }
-            if s >= 90 && settled(&board_series) {
-                break;
-            }
-        }
-        let last = &rows[rows.len().saturating_sub(20)..];
-        let (board_temp, dominant) = board
-            .iter()
-            .map(|&i| (mean(&column(last, i)), i))
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-            .unwrap_or((0.0, board[0]));
-        let spiky_max = spiky
-            .iter()
-            .filter_map(|&i| column(last, i).into_iter().reduce(f64::max))
-            .reduce(f64::max);
-        let (w60, w20) = (
-            &cpu[cpu.len().saturating_sub(60)..],
-            &cpu[cpu.len().saturating_sub(20)..],
-        );
-        let (first, last_s) = (w60[0], w60[w60.len() - 1]);
-        let throttle_ms = delta(first.throttle_ms, last_s.throttle_ms);
-        let throttle_events = delta(first.throttle_count, last_s.throttle_count);
-        let package_w = watts(&w20[0], &w20[w20.len() - 1]);
-        let eq = Equilibrium {
-            duty,
-            rpm: rpm(ec),
-            board_temp,
-            dominant,
-            spiky_max,
-            throttle_ms,
-            throttle_events,
-            package_w,
-            pl1_w: pl1_watts(),
-            mhz: avg_mhz(),
-            guard_hit,
-        };
-        let na = || "n/a".to_string();
-        eprintln!(
-            "  {:>3}% ({} RPM): board {:.1}°C (sensor {}), package {}, throttled {} ms/60 s ({} events), {} of PL1 {}, {} → {}",
-            eq.duty,
-            eq.rpm,
-            eq.board_temp,
-            eq.dominant,
-            eq.spiky_max.map_or("-".into(), |t| format!("{t:.0}°C")),
-            eq.throttle_ms.map_or_else(na, |n| n.to_string()),
-            eq.throttle_events.map_or_else(na, |n| n.to_string()),
-            eq.package_w.map_or_else(na, |w| format!("{w:.1} W")),
-            eq.pl1_w.map_or_else(na, |w| format!("{w:.0} W")),
-            eq.mhz.map_or("-".into(), |m| format!("{m:.0} MHz")),
-            if eq.ok() { "ok" } else { "thermally limited" }
-        );
-        let ok = eq.ok();
-        results.push(eq);
-        if ok {
+        let eq = hold(ec, &sampler, &groups, duty, reference.mhz)?;
+        report("", &eq);
+        if eq.ok() {
+            anchor = Some(eq);
             break;
         }
     }
-    drop(guard); // stop load, EC auto
-
-    let anchor = results
-        .iter()
-        .find(|e| e.ok())
-        .or(results.last())
-        .cloned()
-        .ok_or_else(|| Error("no sustained-load measurement".into()))?;
-    if !anchor.ok() {
-        eprintln!(
-            "  note: the CPU throttles even at {}% fan; the curve tops out there",
-            anchor.duty
-        );
+    let anchor = match anchor {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "  note: only full fan speed avoids thermal limiting; the curve tops out there"
+            );
+            reference
+        }
+    };
+    if let Some(load) = guard.load.take() {
+        load.stop();
     }
+
+    // 6. optional: idle comfort
+    let comfort = match opts.comfort_temp {
+        Some(t) => {
+            step(
+                6,
+                &format!("idle comfort: which fan speed holds the board at {t}°C (up to 9 min)"),
+            );
+            comfort_hold(ec, &sampler, &board, t)?
+        }
+        None => None,
+    };
+    drop(guard); // EC auto
+
     let idle_temp = board
         .iter()
         .map(|&i| mean(&column(&idle_rows, i)))
@@ -785,6 +969,7 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
             .and_then(|i| i.thresholds),
         anchor,
         sensors: board,
+        comfort,
     };
     let strategy = build_strategy(&input, opts.prefer);
 
@@ -890,6 +1075,7 @@ mod tests {
             package_w: Some(20.0),
             pl1_w: Some(28.0),
             mhz: None,
+            ref_mhz: None,
             guard_hit: false,
         }
     }
@@ -906,6 +1092,7 @@ mod tests {
                 ..Default::default()
             }),
             sensors: vec![0, 1, 3],
+            comfort: None,
         }
     }
 
@@ -978,6 +1165,61 @@ mod tests {
         assert!(a.ok());
         a.guard_hit = true;
         assert!(!a.ok());
+    }
+
+    #[test]
+    fn frequency_decides_when_available() {
+        // first calibration run on the Framework 13 Pro: same clocks at every duty, the
+        // old "hot and below PL1" rule wrongly rejected 20 % and 30 %
+        let run = |duty, package, w, mhz| Equilibrium {
+            duty,
+            spiky_max: Some(package),
+            package_w: Some(w),
+            pl1_w: Some(35.0),
+            mhz: Some(mhz),
+            ref_mhz: Some(3090.0),
+            ..eq(duty, 61.0)
+        };
+        assert!(run(20, 92.0, 25.6, 3005.0).ok()); // 97 % of reference (noise is ~±1.5 %)
+        assert!(run(30, 90.0, 25.3, 2997.0).ok());
+        assert!(!run(20, 99.0, 20.0, 2700.0).ok()); // lost 13 % → thermally limited
+        let mut t = run(20, 92.0, 25.6, 3005.0);
+        t.throttle_events = Some(2); // counters still veto
+        assert!(!t.ok());
+    }
+
+    #[test]
+    fn comfort_moves_fan_on_point() {
+        let mut i = input();
+        i.comfort = Some((40.0, 22));
+        let s = build_strategy(&i, Prefer::Quiet);
+        let curve = &s["speedCurve"];
+        assert_eq!(curve[1], json!({"temp": 38.0, "speed": 0}));
+        assert_eq!(curve[2], json!({"temp": 40.0, "speed": 22}));
+        Config::parse(&json!({"defaultStrategy": "x", "strategies": {"x": s}}).to_string())
+            .unwrap();
+        // a duty below what starts the fan is raised to the floor
+        i.comfort = Some((40.0, 3));
+        assert_eq!(
+            build_strategy(&i, Prefer::Quiet)["speedCurve"][2]["speed"],
+            8
+        );
+        // comfort too close to the anchor is ignored
+        i.comfort = Some((65.0, 25));
+        assert_eq!(
+            build_strategy(&i, Prefer::Quiet)["speedCurve"][1]["temp"],
+            44.0
+        );
+    }
+
+    #[test]
+    fn burn_runs_and_stops() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = Arc::clone(&stop);
+        let h = std::thread::spawn(move || burn(&s2, 1));
+        std::thread::sleep(Duration::from_millis(50));
+        stop.store(true, Ordering::Relaxed);
+        h.join().unwrap();
     }
 
     #[test]

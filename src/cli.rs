@@ -98,9 +98,11 @@ local commands (need root, do not talk to the service):
   test-fan <percent> [--seconds N]
                       set the fan duty for N seconds (default 5), then restore EC control
   restore-auto        give fan control back to the EC
-  calibrate [--prefer quiet|balanced|cool] [--apply NAME] [--load-cmd CMD] [--config PATH]
-                      measure fan and thermals (~10-20 min, puts the CPU under load) and
-                      print a strategy; --apply saves it as NAME in the configuration
+  calibrate [--prefer quiet|balanced|cool] [--comfort-temp C] [--apply NAME]
+            [--load-cmd CMD] [--config PATH]
+                      measure fan and thermals (~15-30 min, puts the CPU under load) and
+                      print a strategy; --apply saves it as NAME in the configuration;
+                      --comfort-temp keeps the board (surface) at about C °C in idle
 ";
 
 struct Tokens<'a> {
@@ -276,6 +278,7 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
         load_cmd: None,
         apply: None,
         config: PathBuf::from(DEFAULT_CONFIG_PATH),
+        comfort_temp: None,
     };
     while let Some(tok) = t.peek() {
         if tok == "-h" || tok == "--help" {
@@ -295,6 +298,12 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
             }
             "--apply" => opts.apply = Some(t.value(opt, inline)?.to_string()),
             "--load-cmd" => opts.load_cmd = Some(t.value(opt, inline)?.to_string()),
+            "--comfort-temp" => {
+                opts.comfort_temp = match t.value(opt, inline)?.parse::<f64>() {
+                    Ok(v) if (25.0..=80.0).contains(&v) => Some(v),
+                    _ => bail!("--comfort-temp must be between 25 and 80 °C"),
+                };
+            }
             "--config" | "-c" => opts.config = PathBuf::from(t.value(opt, inline)?),
             _ => bail!("unrecognized arguments: {tok}"),
         }
@@ -406,6 +415,11 @@ mod tests {
         assert_eq!(o.apply.as_deref(), Some("cal"));
         assert_eq!(o.load_cmd.as_deref(), Some("vkcube --c 1"));
         assert!(p("calibrate --prefer loud", false).is_err());
+        let Command::Calibrate(o) = p("calibrate --comfort-temp 40", false).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(o.comfort_temp, Some(40.0));
+        assert!(p("calibrate --comfort-temp 10", false).is_err());
     }
 
     #[test]

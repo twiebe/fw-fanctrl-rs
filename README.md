@@ -108,11 +108,14 @@ The following extras run locally as root and do not talk to the service:
 ## Calibration
 
 ```sh
-sudo fw-fanctrl calibrate [--prefer quiet|balanced|cool] [--apply NAME] [--load-cmd CMD] [--config PATH]
+sudo fw-fanctrl calibrate [--prefer quiet|balanced|cool] [--comfort-temp C] [--apply NAME] \
+                          [--load-cmd CMD] [--config PATH]
 ```
 
-The command takes about 10–20 minutes and puts all CPU cores under full load. It pauses a
-running service and resumes it afterwards. It goes through five phases:
+The command takes about 15–30 minutes and puts all CPU cores under full load. The built-in
+load uses 256-bit FMA when the CPU supports it, which draws more power than integer code
+and comes closer to stress-ng, compilers and games. The calibration therefore errs on the
+warm side. A running service is paused for the duration and resumed afterwards. The phases:
 
 1. **Sensors:** Reads the EC sensor names and thermal thresholds.
 2. **Fan sweep:** Maps duty to RPM and finds the duty that starts the fan from standstill.
@@ -120,26 +123,32 @@ running service and resumes it afterwards. It goes through five phases:
 4. **Load step:** Classifies the sensors. *Board* sensors react slowly and drive the curve.
    *Spiky* sensors (the CPU package) and sensors the EC itself ignores for fan control are
    only used to judge throttling. Sensors that barely react (battery) are dropped.
-5. **Sustained load:** Runs at increasing fixed fan speeds until the board temperature
-   settles. The first speed at which the CPU is no longer *thermally* limited is the anchor
-   of the curve. A speed counts as thermally limited if any of these signals fires:
-   - **Throttle time:** more than 1 % of the last 60 s spent throttled, from
-     `package_throttle_total_time_ms`.
-   - **Throttle events:** new events in `package_throttle_count`.
-   - **Hot and below the power limit:** the package is at 90 °C or more while drawing less
-     than 90 % of its RAPL PL1. At PL1 the CPU is power-limited, and more fan would not help.
-     Without RAPL, 90 °C or more counts as limited on its own.
+5. **Sustained load:** First a reference run at 100 % fan. It measures the CPU frequency
+   without any thermal limit. Then increasing fixed fan speeds, starting at the start duty,
+   each until the board temperature settles. The first speed at which the CPU is not
+   thermally limited is the anchor of the curve:
+   - **Performance decides:** The average frequency must reach at least 95 % of the
+     reference, because thermal limiting costs frequency. A hot package on its own proves
+     nothing: a CPU at 92 °C running the same clocks as at full fan is not held back.
+   - **Kernel counters can veto:** More than 1 % throttle time in the last 60 s
+     (`package_throttle_total_time_ms`) or new `package_throttle_count` events mark the
+     speed as limited. They cannot prove the *absence* of throttling, because both only
+     advance at the start or end of a throttle episode.
+   - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
+     than 90 % of RAPL PL1 counts as limited.
+6. **Idle comfort** (only with `--comfort-temp C`): Without load, the fan first cools the
+   board to C °C at full speed. A slow PI loop then holds it there for 4 minutes. The average
+   fan speed it needs becomes the fan-on point of the curve: off below C−2 °C, that speed at
+   C °C. The surface stays cool in idle and light use with as little fan as possible. If C is
+   not reachable in idle even at full fan, the option is ignored with a warning.
 
-   No single kernel counter is trusted on its own. Both throttle counters only advance when
-   a throttle episode starts or ends, so a CPU held at TjMax for the whole window can leave
-   them unchanged.
+The generated strategy is off until a few degrees above idle (or around the comfort
+temperature), rises gently to the anchor and reaches 100 % at the EC's own `fan_max` for the
+dominant sensor. `--prefer` shifts it:
 
-The generated strategy is off until a few degrees above idle, rises gently to the anchor
-and reaches 100 % at the EC's own `fan_max` for the dominant sensor. `--prefer` shifts it:
-
-| `--prefer` | Anchor duty | Fan starts at | Ramps (up / down / delay) |
+| `--prefer` | Anchor duty | Fan starts at (without `--comfort-temp`) | Ramps (up / down / delay) |
 |------------|-------------|---------------|---------------------------|
-| `quiet` (default) | quietest throttle-free duty | idle + 4 °C | 0.5 / 0.2 %/s, 30 s |
+| `quiet` (default) | quietest duty without thermal limiting | idle + 4 °C | 0.5 / 0.2 %/s, 30 s |
 | `balanced` | × 1.3 | idle + 3 °C | 1.0 / 0.3 %/s, 20 s |
 | `cool` | × 1.7 | idle + 2 °C | 2.0 / 0.5 %/s, 10 s |
 
