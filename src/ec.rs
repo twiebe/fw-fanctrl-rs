@@ -1,8 +1,10 @@
 //! Minimal access to the Framework EC through the kernel's `/dev/cros_ec`.
 //!
 //! Safety design: this module can only send the host commands listed in
-//! [`EcCommand`]. There is no generic pass-through, so nothing in this
-//! program can ever reach flash, reboot or battery commands.
+//! [`EcCommand`]: two writes (fan duty, automatic fan control) and two
+//! read-only queries (sensor info, thermal thresholds). There is no generic
+//! pass-through, so nothing in this program can ever reach flash, reboot,
+//! battery or threshold-setting commands.
 //!
 //! Layouts follow the ChromiumOS EC headers (`ec_commands.h`), the kernel's
 //! `cros_ec_chardev.h` and FrameworkComputer/framework-system.
@@ -31,8 +33,11 @@ struct CmdHeader {
 #[repr(C)]
 struct CmdBuf {
     hdr: CmdHeader,
-    data: [u8; 16], // our largest request is 8 bytes
+    data: [u8; CMD_DATA_SIZE],
 }
+
+/// Largest request is 4 bytes, largest response 33 bytes.
+const CMD_DATA_SIZE: usize = 64;
 
 #[repr(C)]
 struct ReadMem {
@@ -74,21 +79,60 @@ pub enum EcCommand {
     SetFanDuty(u8),
     /// EC_CMD_THERMAL_AUTO_FAN_CTRL (0x0052) v0: hand control back to the EC.
     AutoFanCtrl,
+    /// EC_CMD_TEMP_SENSOR_GET_INFO (0x0070) v0, read-only: sensor name.
+    TempSensorInfo(u8),
+    /// EC_CMD_THERMAL_GET_THRESHOLD (0x0051) v1, read-only. (0x0050 would *set*
+    /// thresholds and is deliberately not available.)
+    ThermalThreshold(u8),
 }
 
 impl EcCommand {
-    /// (command id, version, request payload)
-    fn encode(self) -> Result<(u32, u32, Vec<u8>)> {
+    /// (command id, version, request payload, expected response size)
+    fn encode(self) -> Result<(u32, u32, Vec<u8>, usize)> {
         Ok(match self {
             EcCommand::SetFanDuty(p) => {
                 if p > 100 {
                     bail!("refusing fan duty {p}% (> 100)");
                 }
-                (0x0024, 0, (p as u32).to_le_bytes().to_vec())
+                (0x0024, 0, (p as u32).to_le_bytes().to_vec(), 0)
             }
-            EcCommand::AutoFanCtrl => (0x0052, 0, Vec::new()),
+            EcCommand::AutoFanCtrl => (0x0052, 0, Vec::new(), 0),
+            EcCommand::TempSensorInfo(id) => (0x0070, 0, vec![id], 33),
+            EcCommand::ThermalThreshold(id) => (0x0051, 1, (id as u32).to_le_bytes().to_vec(), 32),
         })
     }
+}
+
+/// EC thermal configuration of one sensor, in °C (`None` = disabled).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Thresholds {
+    pub warn: Option<i32>,
+    pub high: Option<i32>,
+    pub halt: Option<i32>,
+    pub fan_off: Option<i32>,
+    pub fan_max: Option<i32>,
+}
+
+fn decode_thresholds(raw: &[u8]) -> Result<Thresholds> {
+    if raw.len() < 32 {
+        bail!("short thermal threshold response ({} bytes)", raw.len());
+    }
+    let k = |i: usize| u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+    let c = |kelvin: u32| (kelvin != 0).then(|| kelvin as i32 - 273);
+    // layout: temp_host[3], temp_host_release[3], temp_fan_off, temp_fan_max
+    Ok(Thresholds {
+        warn: c(k(0)),
+        high: c(k(1)),
+        halt: c(k(2)),
+        fan_off: c(k(6)),
+        fan_max: c(k(7)),
+    })
+}
+
+fn decode_name(raw: &[u8]) -> String {
+    let name = &raw[..raw.len().min(32)];
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    String::from_utf8_lossy(&name[..end]).into_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,16 +162,28 @@ impl CrosEc {
     }
 
     pub fn send(&self, cmd: EcCommand) -> Result<()> {
-        let (command, version, payload) = cmd.encode()?;
+        self.xfer(cmd).map(|_| ())
+    }
+
+    pub fn sensor_name(&self, id: u8) -> Result<String> {
+        Ok(decode_name(&self.xfer(EcCommand::TempSensorInfo(id))?))
+    }
+
+    pub fn thresholds(&self, id: u8) -> Result<Thresholds> {
+        decode_thresholds(&self.xfer(EcCommand::ThermalThreshold(id))?)
+    }
+
+    fn xfer(&self, cmd: EcCommand) -> Result<Vec<u8>> {
+        let (command, version, payload, insize) = cmd.encode()?;
         let mut buf = CmdBuf {
             hdr: CmdHeader {
                 version,
                 command,
                 outsize: payload.len() as u32,
-                insize: 0, // none of our commands return data
+                insize: insize as u32,
                 result: 0xFF,
             },
-            data: [0; 16],
+            data: [0; CMD_DATA_SIZE],
         };
         buf.data[..payload.len()].copy_from_slice(&payload);
         // SAFETY: `buf` is a properly laid out cros_ec_command followed by a data
@@ -143,7 +199,8 @@ impl CrosEc {
         if buf.hdr.result != 0 {
             bail!("EC rejected {cmd:?} with status {}", buf.hdr.result);
         }
-        Ok(())
+        // the ioctl returns the number of response bytes
+        Ok(buf.data[..(ret as usize).min(insize)].to_vec())
     }
 
     /// Read-only access to the EC memory map.
@@ -233,10 +290,41 @@ mod tests {
     fn whitelist_encoding() {
         assert_eq!(
             EcCommand::SetFanDuty(42).encode().unwrap(),
-            (0x24, 0, vec![42, 0, 0, 0])
+            (0x24, 0, vec![42, 0, 0, 0], 0)
         );
-        assert_eq!(EcCommand::AutoFanCtrl.encode().unwrap(), (0x52, 0, vec![]));
+        assert_eq!(
+            EcCommand::AutoFanCtrl.encode().unwrap(),
+            (0x52, 0, vec![], 0)
+        );
+        assert_eq!(
+            EcCommand::TempSensorInfo(3).encode().unwrap(),
+            (0x70, 0, vec![3], 33)
+        );
+        assert_eq!(
+            EcCommand::ThermalThreshold(1).encode().unwrap(),
+            (0x51, 1, vec![1, 0, 0, 0], 32)
+        );
         assert!(EcCommand::SetFanDuty(101).encode().is_err());
+    }
+
+    #[test]
+    fn threshold_and_name_decoding() {
+        // cpu_f75303@4d from a Framework 13 Pro: - 88 98 / fan 40..78
+        let kelvin = [0u32, 361, 371, 0, 0, 0, 313, 351];
+        let raw: Vec<u8> = kelvin.iter().flat_map(|k| k.to_le_bytes()).collect();
+        assert_eq!(
+            decode_thresholds(&raw).unwrap(),
+            Thresholds {
+                warn: None,
+                high: Some(88),
+                halt: Some(98),
+                fan_off: Some(40),
+                fan_max: Some(78)
+            }
+        );
+        let mut name = b"cpu_f75303@4d".to_vec();
+        name.resize(33, 0);
+        assert_eq!(decode_name(&name), "cpu_f75303@4d");
     }
 
     #[test]

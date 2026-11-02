@@ -98,15 +98,67 @@ The following extras run locally as root and do not talk to the service:
 | `probe` | Print EC temperatures per sensor index, fan RPM and AC state. |
 | `test-fan <percent> [--seconds N]` | Set one duty for N seconds (default 5), then hand control back to the EC. |
 | `restore-auto` | Hand fan control back to the EC. |
+| `calibrate [...]` | Measure this machine and generate a strategy, see below. |
 
 `FW_FANCTRL_SOCKET` overrides the socket path (default
 `/run/fw-fanctrl/.fw-fanctrl.commands.sock`), which is useful for tests without root.
 
+## Calibration
+
+```sh
+sudo fw-fanctrl calibrate [--prefer quiet|balanced|cool] [--apply NAME] [--load-cmd CMD] [--config PATH]
+```
+
+The command takes about 10–20 minutes and puts all CPU cores under full load. It pauses a
+running service and resumes it afterwards. It goes through five phases:
+
+1. **Sensors:** Reads the EC sensor names and thermal thresholds.
+2. **Fan sweep:** Maps duty to RPM and finds the duty that starts the fan from standstill.
+3. **Idle baseline:** Records every sensor while the machine is idle.
+4. **Load step:** Classifies the sensors. *Board* sensors react slowly and drive the curve.
+   *Spiky* sensors (the CPU package) and sensors the EC itself ignores for fan control are
+   only used to judge throttling. Sensors that barely react (battery) are dropped.
+5. **Sustained load:** Runs at increasing fixed fan speeds until the board temperature
+   settles. The first speed at which the CPU no longer throttles thermally, measured with
+   `package_throttle_count` (or, without that counter, the package staying below 95 °C), is
+   the anchor of the curve.
+
+The generated strategy is off until a few degrees above idle, rises gently to the anchor
+and reaches 100 % at the EC's own `fan_max` for the dominant sensor. `--prefer` shifts it:
+
+| `--prefer` | Anchor duty | Fan starts at | Ramps (up / down / delay) |
+|------------|-------------|---------------|---------------------------|
+| `quiet` (default) | quietest throttle-free duty | idle + 4 °C | 0.5 / 0.2 %/s, 30 s |
+| `balanced` | × 1.3 | idle + 3 °C | 1.0 / 0.3 %/s, 20 s |
+| `cool` | × 1.7 | idle + 2 °C | 2.0 / 0.5 %/s, 10 s |
+
+The strategy is always printed as JSON. `--apply NAME` additionally stores it as strategy
+`NAME` in the configuration. The config is validated first, the previous file is kept as
+`config.json.bak-<timestamp>`, and a running service reloads it. Activate it with
+`fw-fanctrl use NAME`, or by setting `"defaultStrategy"`.
+
+`--load-cmd` runs an additional load next to the CPU load, e.g. a GPU benchmark
+(`--load-cmd "glmark2 --run-forever"`). It runs as root through `sh -c` and is stopped at the
+end. Graphical programs may need your session environment as root. Alternatively, start the
+extra load yourself before calibrating, because the measurement includes whatever is running.
+
+Results depend on ambient temperature and on what is plugged in. Recalibrate if the
+conditions change a lot (summer, docked with the lid closed, and so on).
+
 ## Safety
 
-- **Whitelist:** Only `EC_CMD_PWM_SET_FAN_DUTY` (0x24, clamped to 0–100) and
-  `EC_CMD_THERMAL_AUTO_FAN_CTRL` (0x52) can be sent, plus read-only memory-map reads.
-  The EC command interface is never exposed generically.
+- **Whitelist:** Only four EC host commands can be sent:
+  - `EC_CMD_PWM_SET_FAN_DUTY` (0x24, clamped to 0–100)
+  - `EC_CMD_THERMAL_AUTO_FAN_CTRL` (0x52)
+  - `EC_CMD_TEMP_SENSOR_GET_INFO` (0x70, read-only)
+  - `EC_CMD_THERMAL_GET_THRESHOLD` (0x51, read-only)
+
+  Memory-map reads are also allowed and are read-only. Setting thresholds (0x50), flash,
+  reboot and battery commands are unreachable, because the EC command interface is never
+  exposed generically.
+- **Calibration guard:** If any sensor gets within 2 °C of its EC `high` threshold, that fan
+  speed is counted as failed. The fan is handed back to the EC when the calibration ends, is
+  interrupted (Ctrl-C) or fails.
 - **Sanity check at startup:** The EC memory map must identify itself as `EC`, or the
   service refuses to run.
 - **Fail-safe means EC automatic control, not 100 %:**

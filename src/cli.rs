@@ -45,6 +45,7 @@ pub enum Command {
         percent: u8,
         seconds: u64,
     },
+    Calibrate(crate::calibrate::Options),
     RestoreAuto,
     Help,
 }
@@ -55,6 +56,7 @@ impl Command {
         matches!(
             self,
             Command::Run { .. }
+                | Command::Calibrate(_)
                 | Command::Probe
                 | Command::TestFan { .. }
                 | Command::RestoreAuto
@@ -91,6 +93,9 @@ local commands (need root, do not talk to the service):
   test-fan <percent> [--seconds N]
                       set the fan duty for N seconds (default 5), then restore EC control
   restore-auto        give fan control back to the EC
+  calibrate [--prefer quiet|balanced|cool] [--apply NAME] [--load-cmd CMD] [--config PATH]
+                      measure fan and thermals (~10-20 min, puts the CPU under load) and
+                      print a strategy; --apply saves it as NAME in the configuration
 ";
 
 struct Tokens<'a> {
@@ -192,6 +197,7 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
         "probe" if !remote => Command::Probe,
         "restore-auto" if !remote => Command::RestoreAuto,
         "test-fan" if !remote => parse_test_fan(&mut t)?,
+        "calibrate" if !remote => parse_calibrate(&mut t)?,
         other => bail!("invalid command: '{other}' (see 'fw-fanctrl --help')"),
     };
 
@@ -243,6 +249,39 @@ fn parse_run(t: &mut Tokens) -> Result<Command> {
         silent,
         backend,
     })
+}
+
+fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
+    use crate::calibrate::{Options, Prefer};
+    let mut opts = Options {
+        prefer: Prefer::Quiet,
+        load_cmd: None,
+        apply: None,
+        config: PathBuf::from(DEFAULT_CONFIG_PATH),
+    };
+    while let Some(tok) = t.peek() {
+        if tok == "-h" || tok == "--help" {
+            break;
+        }
+        t.next();
+        let (opt, inline) = split_opt(tok);
+        match opt {
+            "--prefer" => {
+                let v = t.value(opt, inline)?;
+                opts.prefer = match Prefer::parse(v) {
+                    Some(p) => p,
+                    None => bail!(
+                        "argument --prefer: invalid choice: '{v}' (choose from 'quiet', 'balanced', 'cool')"
+                    ),
+                };
+            }
+            "--apply" => opts.apply = Some(t.value(opt, inline)?.to_string()),
+            "--load-cmd" => opts.load_cmd = Some(t.value(opt, inline)?.to_string()),
+            "--config" | "-c" => opts.config = PathBuf::from(t.value(opt, inline)?),
+            _ => bail!("unrecognized arguments: {tok}"),
+        }
+    }
+    Ok(Command::Calibrate(opts))
 }
 
 fn parse_test_fan(t: &mut Tokens) -> Result<Command> {
@@ -323,9 +362,27 @@ mod tests {
 
     #[test]
     fn remote_cannot_run_local_commands() {
-        for c in ["run", "probe", "restore-auto", "test-fan 50"] {
+        for c in ["run", "probe", "restore-auto", "test-fan 50", "calibrate"] {
             assert!(p(c, true).is_err(), "{c}");
         }
+    }
+
+    #[test]
+    fn calibrate_options() {
+        use crate::calibrate::Prefer;
+        let Command::Calibrate(o) = p(
+            r#"calibrate --prefer balanced --apply cal --load-cmd "vkcube --c 1""#,
+            false,
+        )
+        .unwrap()
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(o.prefer, Prefer::Balanced);
+        assert_eq!(o.apply.as_deref(), Some("cal"));
+        assert_eq!(o.load_cmd.as_deref(), Some("vkcube --c 1"));
+        assert!(p("calibrate --prefer loud", false).is_err());
     }
 
     #[test]
