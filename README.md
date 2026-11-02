@@ -59,12 +59,14 @@ A fixed curve cannot know which fan speed holds a warm-but-idle machine at a ple
 surface temperature: that depends on the room, on whether it sits on a desk or a lap, on
 a dock or a closed lid. With `comfortTemp` this part is regulated at runtime instead:
 
-- Outside a ±0.5 °C deadband (the sensors report whole degrees), the comfort speed moves by
-  0.05 % per second and degree of error. It is slow on purpose: the board sensors react
-  with minutes of delay, and a hunting fan is more annoying than a steady one.
-- The fan target is the higher of the curve and the comfort speed. Under load the curve
-  takes over; while the curve asks for more, the comfort speed does not wind up, so it is
-  ready again as soon as the load ends.
+- Outside a ±0.5 °C deadband (the sensors report whole degrees), the comfort speed rises by
+  0.05 % and falls by 0.1 % per second and degree of error. It is slow on purpose: the
+  board sensors react with minutes of delay, and a hunting fan is more annoying than a
+  steady one. Backing off is faster because too much fan is audible.
+- The fan target is the higher of the curve and the comfort speed. It only adds fan up to
+  4 °C above `comfortTemp`. Above that (load) the curve alone is in charge. It never adds fan
+  while the curve already asks for more or while the temperature is falling anyway, so it
+  does not wind up under load and is back at its idle value when the load ends.
 - It is limited to `comfortMaxSpeed` (default 30 %). `minSpeed`, the ramps, `criticalTemp`
   and the emergency guard apply as usual.
 - `fw-fanctrl print` shows its current value as `ComfortSpeed`.

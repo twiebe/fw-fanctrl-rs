@@ -12,6 +12,12 @@ pub const MIN_OFF_SECS: f64 = 3.0;
 /// Comfort controller: integral gain in %/(°C·s). Slow on purpose: the board
 /// sensors lag by minutes, and a hunting fan is worse than a steady one.
 pub const COMFORT_KI: f64 = 0.05;
+/// Backing off is twice as fast: too much fan is audible, too little only means
+/// the board warms up slowly and the controller comes back.
+pub const COMFORT_KI_DOWN: f64 = 0.1;
+/// The comfort controller only adds fan up to this far above its target; beyond
+/// that the curve alone is in charge (load).
+pub const COMFORT_ZONE: f64 = 4.0;
 /// No correction while the temperature is within this of the comfort target
 /// (sensors report whole degrees).
 pub const COMFORT_DEADBAND: f64 = 0.5;
@@ -90,6 +96,18 @@ impl Controller {
         self.output.map(|o| o.round() as u8)
     }
 
+    /// The temperature dropped by more than 0.5 °C over the last minute
+    /// (mean of the last 15 readings vs. 45..60 s ago).
+    fn falling(&self) -> bool {
+        let valid: Vec<f64> = self.history.iter().copied().filter(|t| *t > 0.0).collect();
+        let n = valid.len();
+        if n < 60 {
+            return false;
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        mean(&valid[n - 15..]) - mean(&valid[n - 60..n - 45]) < -0.5
+    }
+
     /// Mean of the last `interval` valid (> 0) readings, upstream semantics.
     pub fn moving_average(&self, interval: u32, current: f64) -> f64 {
         let valid: Vec<f64> = self.history.iter().copied().filter(|t| *t > 0.0).collect();
@@ -125,7 +143,9 @@ impl Controller {
             self.target = self.curve_target;
             if let Some(ct) = s.ramp.comfort_temp {
                 let max = s.ramp.comfort_max_speed.unwrap_or(COMFORT_MAX_SPEED) as f64;
-                self.comfort = comfort_step(self.comfort, avg, ct, max, self.curve_target, dt);
+                let falling = self.falling();
+                self.comfort =
+                    comfort_step(self.comfort, avg, ct, max, self.curve_target, falling, dt);
                 self.target = self.target.max(self.comfort.round());
             }
         }
@@ -195,18 +215,32 @@ impl Controller {
 }
 
 /// One step of the comfort integral controller. Outside the deadband it moves by
-/// `COMFORT_KI` per degree of error and second. It does not wind up while the
-/// curve already asks for more (load), so it is ready right after the load ends.
-fn comfort_step(u: f64, temp: f64, target: f64, max: f64, curve: f64, dt: f64) -> f64 {
+/// `COMFORT_KI` (up) or `COMFORT_KI_DOWN` (down) per degree of error and second.
+/// It never adds fan while the curve already asks for more, above the comfort
+/// zone (load: the curve's job), or while the temperature is falling anyway
+/// (after load), so it does not wind up and is at its idle value right after.
+fn comfort_step(
+    u: f64,
+    temp: f64,
+    target: f64,
+    max: f64,
+    curve: f64,
+    falling: bool,
+    dt: f64,
+) -> f64 {
     let err = temp - target;
     if err.abs() <= COMFORT_DEADBAND {
         return u;
     }
     let e = err - COMFORT_DEADBAND.copysign(err);
-    if e > 0.0 && curve > u {
-        return u;
+    if e > 0.0 {
+        if curve > u || falling || err > COMFORT_ZONE {
+            return u;
+        }
+        (u + COMFORT_KI * e * dt).min(max)
+    } else {
+        (u + COMFORT_KI_DOWN * e * dt).max(0.0)
     }
-    (u + COMFORT_KI * e * dt).clamp(0.0, max)
 }
 
 /// Keep the output out of the band (0, min): from standstill only start once the
@@ -457,27 +491,48 @@ mod tests {
         // within the deadband nothing moves
         let held = run(&mut c, &s, &[41.4; 60]);
         assert!(held.iter().all(|&o| o == 11));
-        // too cool: backs off by 0.025 %/s, then holds minSpeed until it reaches 0
-        let down = run(&mut c, &s, &[40.0; 600]);
+        // too cool: backs off by 0.05 %/s, then holds minSpeed until it reaches 0
+        let down = run(&mut c, &s, &[40.0; 300]);
         assert_eq!(down[100], 10);
         assert_eq!(*down.last().unwrap(), 0);
         assert_eq!(c.tick(&s, 40.0, 1.0, false).comfort, Some(0));
     }
 
     #[test]
-    fn comfort_controller_does_not_wind_up_under_load_and_is_capped() {
-        let s = comfort_strategy(50.0, None);
+    fn comfort_controller_does_not_wind_up_under_load() {
+        // a curve that rises slowly above the comfort zone, like a calibrated one
+        let mut s = comfort_strategy(45.0, Some(10));
+        s.speed_curve.insert(
+            1,
+            CurvePoint {
+                temp: 65.0,
+                speed: 50,
+            },
+        );
+        s.ramp.up_rate = Some(1.0);
+        s.ramp.down_rate = Some(0.3);
         let mut c = Controller::new();
-        run(&mut c, &s, &[43.0; 100]); // ~7.5 %
-        let before = c.tick(&s, 43.0, 1.0, false).comfort;
-        // load: the curve asks for far more, the controller stays put
-        let load = run(&mut c, &s, &[80.0; 300]);
-        assert_eq!(*load.last().unwrap(), 75);
-        assert_eq!(c.tick(&s, 80.0, 1.0, false).comfort, before);
-        // the curve does not cover it at all: capped at COMFORT_MAX_SPEED
+        run(&mut c, &s, &[43.0; 150]); // idle: ~11 %
+        let idle = c.tick(&s, 43.0, 1.0, false).comfort.unwrap();
+        assert!((10..=12).contains(&idle), "{idle}");
+        // load: up to 65 °C within a minute, 5 minutes there, 10 minutes back to 41
+        let mut temps: Vec<f64> = (0..60).map(|i| 43.0 + 22.0 * i as f64 / 60.0).collect();
+        temps.extend([65.0; 300]);
+        temps.extend((0..600).map(|i| 65.0 - 24.0 * i as f64 / 600.0));
+        let mut peak = 0;
+        for t in temps {
+            peak = peak.max(c.tick(&s, t, 1.0, false).comfort.unwrap());
+        }
+        assert!(peak <= idle + 1, "comfort wound up to {peak} (idle {idle})");
+        let after = run(&mut c, &s, &[41.0; 120]);
+        assert!(*after.last().unwrap() <= idle + 1);
+    }
+
+    #[test]
+    fn comfort_controller_is_capped() {
         let s = comfort_strategy(95.0, None);
         let mut c = Controller::new();
-        let out = run(&mut c, &s, &[60.0; 1000]);
+        let out = run(&mut c, &s, &[44.0; 2000]);
         assert_eq!(*out.last().unwrap(), COMFORT_MAX_SPEED);
     }
 
