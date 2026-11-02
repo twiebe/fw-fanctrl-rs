@@ -111,9 +111,10 @@ local commands (need root, do not talk to the service):
   test-fan <percent> [--seconds N]
                       set the fan duty for N seconds (default 5), then restore EC control
   restore-auto        give fan control back to the EC
-  calibrate measure [--load-cmd CMD] [--output PATH]
-                      measure fan and thermals once (~30-40 min, puts the CPU under
-                      load) and save the data (default /etc/fw-fanctrl/calibration.json)
+  calibrate measure [--load-cmd CMD] [--output PATH] [--comfort-only]
+                      measure fan and thermals once (~45-60 min, puts the CPU under
+                      load) and save the data (default /etc/fw-fanctrl/calibration.json);
+                      --comfort-only redoes only the idle phase and updates the file
   calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--default]
             [--dry-run] [--config PATH] [--calibration PATH]
                       create a strategy from the saved data (default: balanced, named
@@ -326,6 +327,7 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
             let mut opts = MeasureOptions {
                 load_cmd: None,
                 output: PathBuf::from(CALIBRATION_PATH),
+                comfort_only: false,
             };
             while let Some(tok) = t.peek() {
                 if tok == "-h" || tok == "--help" {
@@ -336,6 +338,7 @@ fn parse_calibrate(t: &mut Tokens) -> Result<Command> {
                 match opt {
                     "--load-cmd" => opts.load_cmd = Some(t.value(opt, inline)?.to_string()),
                     "--output" | "-o" => opts.output = PathBuf::from(t.value(opt, inline)?),
+                    "--comfort-only" => opts.comfort_only = true,
                     _ => bail!("unrecognized arguments: {tok}"),
                 }
             }
@@ -525,6 +528,14 @@ mod tests {
         };
         assert_eq!(m.load_cmd.as_deref(), Some("vkcube --c 1"));
         assert_eq!(m.output, PathBuf::from("/etc/fw-fanctrl/calibration.json"));
+        assert!(!m.comfort_only);
+        let Command::CalibrateMeasure(m) = p("calibrate measure --comfort-only", false)
+            .unwrap()
+            .command
+        else {
+            panic!()
+        };
+        assert!(m.comfort_only);
 
         let Command::CalibrateApply(a) = p("calibrate apply", false).unwrap().command else {
             panic!()

@@ -124,14 +124,14 @@ Calibration has two steps. **Measure once**, which takes a while and needs the h
 Then **apply** the result as often as you like, which is instant.
 
 ```sh
-sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH]
+sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH] [--comfort-only]
 sudo fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--default] [--dry-run]
 fw-fanctrl use calibrated-balanced
 ```
 
 ### `calibrate measure`
 
-It takes about 30–40 minutes and puts all CPU cores under full load. The raw data is saved
+It takes about 45–60 minutes and puts all CPU cores under full load. The raw data is saved
 to `/etc/fw-fanctrl/calibration.json`, and a summary at the end shows the result for each
 preference and comfort temperature. The built-in
 load uses 256-bit FMA when the CPU supports it, which draws more power than integer code
@@ -173,9 +173,15 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      "lowered from … W" when the limit dropped below the highest value seen.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
-6. **Idle comfort:** Without load, the fan first cools the board to 40 °C at full speed. A
-   slow PI loop then holds it at 40, 43 and 46 °C in turn (2.5 minutes each) and records the
-   average fan speed each needs. Targets that are not reachable even at full fan are skipped.
+6. **Idle comfort:** Without load, fixed fan speeds in descending order (30, 20, 15 %,
+   `minSpeed`, then off), each held until the board temperature settles (2–6 minutes). It
+   records the temperature each speed holds the board at. The fan-off step stops at 52 °C.
+   Fixed speeds are used on purpose: a controller that tries to hold a target temperature
+   needs much longer than a few minutes to find the real idle duty, and it overshoots
+   towards too much fan.
+
+`--comfort-only` redoes only phase 6 (no CPU load, up to 30 minutes) and updates the
+saved file in place. Everything else is kept.
 
 ### `calibrate apply`
 
@@ -191,7 +197,8 @@ reaches 100 % at the EC's own `fan_max` for the dominant sensor. It also gets `m
 `--comfort-temp C` keeps the surface cool in idle and light use with as little fan as
 possible. The fan speed needed to hold the board at C °C is interpolated from the comfort
 measurement and becomes the fan-on point of the curve: off below C−2 °C, that speed at C °C.
-Outside 40–46 °C the nearest measured value is used, with a warning.
+Fractions such as `41.5` work. Outside the measured range the nearest measured value is
+used, with a warning.
 
 The preference (default `balanced`) sets the trade-off between noise and performance. The anchor is the quietest fan
 speed that reaches this share of the full-fan performance, and real CPU throttling is never
