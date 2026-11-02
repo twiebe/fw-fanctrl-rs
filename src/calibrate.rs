@@ -156,6 +156,8 @@ pub struct Equilibrium {
     pub ref_mhz: Option<f64>,
     /// A sensor came within 2 °C of its EC "high" threshold.
     pub guard_hit: bool,
+    /// The board temperature settled (false: stopped at the 4-minute cap or by the guard).
+    pub settled: bool,
 }
 
 impl Equilibrium {
@@ -470,8 +472,18 @@ fn watts(a: &CpuSample, b: &CpuSample) -> Option<f64> {
     (eb >= ea && secs > 0.0).then(|| (eb - ea) as f64 / 1e6 / secs)
 }
 
+/// Effective long-term package limit: the lower of the MSR and the MMIO RAPL
+/// interface (firmware/DPTF often lowers only the MMIO one).
 fn pl1_watts() -> Option<f64> {
-    read_u64(&format!("{RAPL_DIR}/constraint_0_power_limit_uw")).map(|uw| uw as f64 / 1e6)
+    [
+        "/sys/class/powercap/intel-rapl:0",
+        "/sys/class/powercap/intel-rapl-mmio:0",
+    ]
+    .iter()
+    .filter_map(|d| read_u64(&format!("{d}/constraint_0_power_limit_uw")))
+    .filter(|uw| *uw > 0)
+    .map(|uw| uw as f64 / 1e6)
+    .reduce(f64::min)
 }
 
 fn avg_mhz() -> Option<f64> {
@@ -630,6 +642,17 @@ fn stable_rpm(ec: &CrosEc, sampler: &Sampler) -> Result<u16> {
     Ok(r)
 }
 
+/// First (quietest) result that is fine against `ref_mhz`.
+pub fn pick_anchor(results: &[Equilibrium], ref_mhz: Option<f64>) -> Option<Equilibrium> {
+    results
+        .iter()
+        .map(|e| Equilibrium {
+            ref_mhz,
+            ..e.clone()
+        })
+        .find(Equilibrium::ok)
+}
+
 struct Groups<'a> {
     board: &'a [usize],
     spiky: &'a [usize],
@@ -649,6 +672,7 @@ fn hold(
     let mut rows = Vec::new();
     let mut cpu = Vec::new();
     let mut guard_hit = false;
+    let mut is_settled = false;
     for s in 0..240 {
         let (row, hit) = sampler.sample()?;
         cpu.push(CpuSample::now());
@@ -661,6 +685,7 @@ fn hold(
             break;
         }
         if s >= 90 && settled(&board_series) {
+            is_settled = true;
             break;
         }
     }
@@ -695,6 +720,7 @@ fn hold(
         mhz: (!mhz.is_empty()).then(|| mean(&mhz)),
         ref_mhz,
         guard_hit,
+        settled: is_settled,
     })
 }
 
@@ -706,11 +732,12 @@ fn report(label: &str, eq: &Equilibrium) {
         label
     };
     eprintln!(
-        "  {:>3}% ({} RPM): board {:.1}°C (sensor {}), package {}, {} ({}), throttled {} ms/60 s ({} events), {} of PL1 {} → {}",
+        "  {:>3}% ({} RPM): board {:.1}°C (sensor {}, {}), package {}, {} ({}), throttled {} ms/60 s ({} events), {} of PL1 {} → {}",
         eq.duty,
         eq.rpm,
         eq.board_temp,
         eq.dominant,
+        if eq.settled { "settled" } else { "4-min cap" },
         eq.spiky_max.map_or("-".into(), |t| format!("{t:.0}°C")),
         eq.mhz.map_or("-".into(), |m| format!("{m:.0} MHz")),
         eq.relative_mhz()
@@ -996,26 +1023,47 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     let mut reference = hold(ec, &sampler, &groups, 100, None)?;
     reference.ref_mhz = reference.mhz;
     report("reference", &reference);
-    let mut duties: Vec<u8> = vec![min_speed, 20, 30, 40, 55, 75];
+    let mut duties: Vec<u8> = vec![min_speed, 20, 30, 40, 55, 65, 75, 85];
     duties.retain(|d| *d >= min_speed && *d < 100);
     duties.sort_unstable();
     duties.dedup();
+    let mut results = Vec::new();
     let mut anchor = None;
     for duty in duties {
         let eq = hold(ec, &sampler, &groups, duty, reference.mhz)?;
         report("", &eq);
-        if eq.ok() {
-            anchor = Some(eq);
+        let ok = eq.ok();
+        results.push(eq);
+        if ok {
+            anchor = results.last().cloned();
             break;
         }
     }
     let anchor = match anchor {
         Some(a) => a,
         None => {
-            eprintln!(
-                "  note: only full fan speed avoids thermal limiting; the curve tops out there"
-            );
-            reference
+            // Nothing reached the first reference. Measure full fan again after the
+            // same soak time: if the CPU is slower now too, the first reference was
+            // inflated (time-dependent power budget), and the steps are judged again
+            // against this fair one.
+            let mut end = hold(ec, &sampler, &groups, 100, None)?;
+            end.ref_mhz = end.mhz;
+            report("reference (end)", &end);
+            match pick_anchor(&results, end.mhz) {
+                Some(a) => {
+                    eprintln!(
+                        "  judged against the end reference: {}% is the quietest speed without loss",
+                        a.duty
+                    );
+                    a
+                }
+                None => {
+                    eprintln!(
+                        "  note: only full fan speed avoids losing performance; the curve tops out there"
+                    );
+                    end
+                }
+            }
         }
     };
     if let Some(load) = guard.load.take() {
@@ -1156,6 +1204,7 @@ mod tests {
             pl1_w: Some(28.0),
             mhz: None,
             ref_mhz: None,
+            settled: true,
             guard_hit: false,
         }
     }
@@ -1266,6 +1315,27 @@ mod tests {
         let mut t = run(20, 92.0, 25.6, 3005.0);
         t.throttle_events = Some(2); // counters still veto
         assert!(!t.ok());
+    }
+
+    #[test]
+    fn end_reference_rejudges_steps() {
+        // second calibration run: no throttling from 40 % on, but a flat 30 W vs 33 W
+        // in the early reference
+        let step = |duty, mhz| Equilibrium {
+            mhz: Some(mhz),
+            ref_mhz: Some(2632.0),
+            ..eq(duty, 70.0)
+        };
+        let mut results = vec![step(40, 2405.0), step(55, 2435.0), step(75, 2465.0)];
+        results[0].throttle_ms = Some(0);
+        assert!(results.iter().all(|e| !e.ok()));
+        // end reference just as slow → 40 % is fine
+        assert_eq!(pick_anchor(&results, Some(2470.0)).unwrap().duty, 40);
+        // end reference fast again → still nothing
+        assert!(pick_anchor(&results, Some(2630.0)).is_none());
+        // throttling still vetoes
+        results[0].throttle_ms = Some(30_000);
+        assert_eq!(pick_anchor(&results, Some(2470.0)).unwrap().duty, 55);
     }
 
     #[test]

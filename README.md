@@ -138,6 +138,14 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      (`package_throttle_total_time_ms`) or new `package_throttle_count` events mark the
      speed as limited. They cannot prove the *absence* of throttling, because both only
      advance at the start or end of a throttle episode.
+   - **End reference:** If no speed passes, full fan is measured once more after the same
+     soak time, and all steps are judged again against it. Some power budgets are
+     time-dependent, and then an early reference is unfairly fast. The quietest step that
+     passes against the end reference becomes the anchor.
+   - **Settled or capped:** Each step shows whether the board temperature settled or the
+     step stopped at its 4-minute cap.
+   - **PL1:** The effective PL1 is the lower of the MSR and the MMIO RAPL limit. Firmware and
+     DPTF often lower only the MMIO one.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
 6. **Idle comfort** (only with `--comfort-temp C`): Without load, the fan first cools the
