@@ -11,8 +11,10 @@ pub enum Signal {
 }
 
 extern "C" fn on_signal(sig: libc::c_int) {
-    // Only an atomic store: async-signal-safe. A stop request is never downgraded.
-    if PENDING.load(Ordering::SeqCst) != libc::SIGTERM {
+    // Only atomics: async-signal-safe. A pending stop (TERM or INT) is never
+    // downgraded to a reload.
+    let pending = PENDING.load(Ordering::SeqCst);
+    if pending != libc::SIGTERM && pending != libc::SIGINT {
         PENDING.store(sig, Ordering::SeqCst);
     }
 }

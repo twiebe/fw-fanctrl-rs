@@ -35,7 +35,11 @@ pub enum Command {
     Use(String),
     Reset,
     Reload,
-    Pause,
+    /// `lease`: resume automatically after this many seconds unless renewed
+    /// (used by `calibrate`, so a killed calibration cannot leave the fan unmanaged).
+    Pause {
+        lease: Option<u64>,
+    },
     Resume,
     Print(PrintSelection),
     SetConfig(String),
@@ -82,7 +86,8 @@ commands:
   use <strategy>      change the current strategy
   reset               reset to the default strategy
   reload              reload the configuration file
-  pause               pause the service (EC automatic control takes over)
+  pause [--lease N]   pause the service (EC automatic control takes over);
+                      with --lease it resumes by itself after N seconds unless renewed
   resume              resume the service
   print [all|active|current|list|speed]
                       print the selected information (default: all)
@@ -178,7 +183,20 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
         },
         "reset" => Command::Reset,
         "reload" => Command::Reload,
-        "pause" => Command::Pause,
+        "pause" => {
+            let mut lease = None;
+            if let Some(tok) = t.peek()
+                && tok.starts_with("--lease")
+            {
+                t.next();
+                let (opt, inline) = split_opt(tok);
+                lease = match t.value(opt, inline)?.parse::<u64>() {
+                    Ok(v) if (1..=3600).contains(&v) => Some(v),
+                    _ => bail!("--lease must be between 1 and 3600 seconds"),
+                };
+            }
+            Command::Pause { lease }
+        }
         "resume" => Command::Resume,
         "print" => Command::Print(match t.next().unwrap_or("all") {
             "all" => PrintSelection::All,
@@ -350,6 +368,11 @@ mod tests {
             p("--sc unix print list", true).unwrap().command,
             Command::Print(PrintSelection::List)
         );
+        assert_eq!(
+            p("pause --lease 30", true).unwrap().command,
+            Command::Pause { lease: Some(30) }
+        );
+        assert!(p("pause --lease 0", true).is_err());
         assert_eq!(
             p("--output-format=JSON pause", true).unwrap().output_format,
             OutputFormat::Json

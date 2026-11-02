@@ -62,6 +62,9 @@ impl Strategy {
             return curve[lo].speed;
         }
         let (a, b) = (&curve[lo], &curve[hi]);
+        if b.temp == a.temp {
+            return b.speed; // step (upstream's loop never gets here, guard anyway)
+        }
         let slope = (b.speed as f64 - a.speed as f64) / (b.temp - a.temp);
         // Python's int() truncates towards zero, so does `as`.
         let speed = (a.speed as f64 + (temp - a.temp) * slope) as i64;
@@ -146,10 +149,11 @@ fn parse_strategy(name: &str, value: &Value) -> Result<Strategy> {
     for p in &raw.speed_curve {
         check_range(name, "speedCurve temp", p.temp, 0.0, 100.0)?;
         check_range(name, "speedCurve speed", p.speed as f64, 0.0, 100.0)?;
+        // Equal temps are allowed (upstream accepts them; they form a step).
         if let Some(prev) = curve.last().map(|c: &CurvePoint| c.temp)
-            && p.temp <= prev
+            && p.temp < prev
         {
-            bail!("strategy '{name}': speedCurve temps must be strictly ascending");
+            bail!("strategy '{name}': speedCurve temps must be ascending");
         }
         curve.push(CurvePoint {
             temp: p.temp,
@@ -275,8 +279,16 @@ impl Config {
         serde::Serialize::serialize(&self.data, &mut ser)?;
         buf.push(b'\n');
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &buf)?;
-        fs::rename(&tmp, path)?;
+        let write = || -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &buf)?;
+            f.sync_all()?;
+            fs::rename(&tmp, path)
+        };
+        if let Err(e) = write() {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -427,6 +439,26 @@ mod tests {
         let c = Config::parse(r#"{"defaultStrategy":"a","strategies":{"b":{"speedCurve":[{"temp":0,"speed":1}]},"a":{"speedCurve":[{"temp":0,"speed":1}]}}}"#).unwrap();
         assert_eq!(c.data["$schema"], SCHEMA_REF);
         assert_eq!(c.names(), ["b", "a"]);
+    }
+
+    #[test]
+    fn step_curves_like_upstream() {
+        let c = Config::parse(r#"{"defaultStrategy":"a","strategies":{"a":{"speedCurve":[
+            {"temp":0,"speed":10},{"temp":50,"speed":15},{"temp":50,"speed":30},{"temp":80,"speed":100}]}}}"#)
+        .unwrap();
+        let s = c.strategy("a").unwrap();
+        // upstream adapt_speed: <= 50 interpolates towards the first 50 point, > 50 from the second
+        assert_eq!(s.target_speed(25.0), 12);
+        assert_eq!(s.target_speed(50.0), 15);
+        assert_eq!(s.target_speed(50.5), 31);
+        assert_eq!(s.target_speed(80.0), 100);
+        let only = Config::parse(
+            r#"{"defaultStrategy":"a","strategies":{"a":{"speedCurve":[
+            {"temp":50,"speed":15},{"temp":50,"speed":30}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(only.strategy("a").unwrap().target_speed(40.0), 15);
+        assert_eq!(only.strategy("a").unwrap().target_speed(60.0), 30);
     }
 
     #[test]

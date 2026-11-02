@@ -9,7 +9,8 @@ jumping between curve points.
   socket and output formats (NATURAL / JSON) as upstream. Existing configs work unchanged.
 - New optional per-strategy keys for ramping (see below).
 - Talks to the EC directly through the kernel's `/dev/cros_ec` with a hard-coded
-  whitelist of three operations. It never spawns `framework_tool` or `ectool`.
+  whitelist of four commands (two writes, two read-only queries). It never spawns
+  `framework_tool` or `ectool`.
 - A single ~500 KB binary that needs only glibc, uses about 2 MB of RAM and does one
   tick per second.
 
@@ -70,7 +71,8 @@ corrections are quick and big jumps are spread out.
 Differences in validation compared to upstream:
 
 - Unknown keys are rejected, so a typo like `rampUpRtae` fails loudly instead of being ignored.
-- `speedCurve` temperatures must be strictly ascending.
+- `speedCurve` temperatures must be ascending. Equal temperatures are allowed and form a
+  step, as in upstream.
 - `strategyOnDischarging` may be omitted (it is treated as `""`).
 
 `resources/config.schema.json` is the upstream schema extended by the keys above.
@@ -120,16 +122,17 @@ running service and resumes it afterwards. It goes through five phases:
    only used to judge throttling. Sensors that barely react (battery) are dropped.
 5. **Sustained load:** Runs at increasing fixed fan speeds until the board temperature
    settles. The first speed at which the CPU is no longer *thermally* limited is the anchor
-   of the curve. The checks, best signal first:
-   - **Throttle time:** time spent throttled from `package_throttle_total_time_ms`, at most
-     1 % of the last 60 s.
-   - **Throttle events plus power:** if the throttle time is not available, no new throttle
-     events, and the package is either below 95 °C or drawing at least 90 % of its RAPL PL1.
-     At PL1 the CPU is power-limited, and more fan would not help.
-   - **Package temperature only:** without RAPL, the package must stay below 95 °C.
+   of the curve. A speed counts as thermally limited if any of these signals fires:
+   - **Throttle time:** more than 1 % of the last 60 s spent throttled, from
+     `package_throttle_total_time_ms`.
+   - **Throttle events:** new events in `package_throttle_count`.
+   - **Hot and below the power limit:** the package is at 90 °C or more while drawing less
+     than 90 % of its RAPL PL1. At PL1 the CPU is power-limited, and more fan would not help.
+     Without RAPL, 90 °C or more counts as limited on its own.
 
-   The event counter alone proves nothing, because it only increments when throttling
-   starts, not while it continues.
+   No single kernel counter is trusted on its own. Both throttle counters only advance when
+   a throttle episode starts or ends, so a CPU held at TjMax for the whole window can leave
+   them unchanged.
 
 The generated strategy is off until a few degrees above idle, rises gently to the anchor
 and reaches 100 % at the EC's own `fan_max` for the dominant sensor. `--prefer` shifts it:
@@ -146,9 +149,15 @@ The strategy is always printed as JSON. `--apply NAME` additionally stores it as
 `fw-fanctrl use NAME`, or by setting `"defaultStrategy"`.
 
 `--load-cmd` runs an additional load next to the CPU load, e.g. a GPU benchmark
-(`--load-cmd "glmark2 --run-forever"`). It runs as root through `sh -c` and is stopped at the
-end. Graphical programs may need your session environment as root. Alternatively, start the
-extra load yourself before calibrating, because the measurement includes whatever is running.
+(`--load-cmd "glmark2 --run-forever"`). The command is split like a shell would split it,
+but it is not run through a shell, so it receives SIGTERM if the calibration dies. Use
+`sh -c '…'` explicitly for pipelines. It runs as root and is stopped at the end. Graphical
+programs may need your session environment as root. Alternatively, start the extra load
+yourself before calibrating, because the measurement includes whatever is running.
+
+While calibrating, the running service is paused with a 30 s lease that is renewed every
+10 s. If the calibration is killed (even with `kill -9`), the service takes over the fan
+again within 30 s.
 
 Results depend on ambient temperature and on what is plugged in. Recalibrate if the
 conditions change a lot (summer, docked with the lid closed, and so on).
@@ -174,6 +183,19 @@ conditions change a lot (summer, docked with the lid closed, and so on).
   - on `pause`, on suspend (via `fw-fanctrl-suspend.service`) and on SIGTERM/SIGINT,
   - on panic (from a panic hook),
   - after any stop, including crashes and watchdog kills (`ExecStopPost=fw-fanctrl restore-auto`).
+
+  If handing control back fails (EC busy), it is retried every second until it works.
+- **Fresh start after pause and fail-safe:** On `resume` and on recovery the controller
+  forgets its history and starts at the curve value for the current readings. A machine that
+  heated up meanwhile does not get a slow ramp from the old value.
+- **Global emergency guard:** If *any* sensor, selected in `sensors` or not, comes within
+  3 °C of its EC `high` threshold, the fan goes to 100 % at once.
+- **Second instance:** If another fw-fanctrl owns the socket, the service exits with code 3
+  and systemd does not restart it (`RestartPreventExitStatus=3`). `/run/fw-fanctrl` is kept
+  across restarts, so the other instance's socket is never deleted.
+- **Socket permissions:** The socket is world-accessible like upstream, so desktop tools can
+  run `use`, `print`, `pause` and so on. `set_config`, which rewrites the config file, is only
+  accepted from root (checked with `SO_PEERCRED`).
 - **Watchdog:** The service runs as `Type=notify` with `WatchdogSec=15`, so a hung loop is restarted.
 - **Periodic refresh:** An unchanged duty is re-sent every 30 s, in case the EC was reset to
   auto mode behind our back.

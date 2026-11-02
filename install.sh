@@ -46,5 +46,7 @@ install -m 0644 "$HERE/resources/config.schema.json" "$CONFDIR/config.schema.jso
 [ -e "$CONFDIR/config.json" ] || install -m 0644 "$HERE/resources/config.json" "$CONFDIR/config.json"
 
 systemctl daemon-reload
-systemctl enable --now fw-fanctrl.service fw-fanctrl-suspend.service
+systemctl enable --now fw-fanctrl.service
+# only enable the sleep hook: starting it now would pause/resume the service once
+systemctl enable fw-fanctrl-suspend.service
 echo "installed; check with: fw-fanctrl print"

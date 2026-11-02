@@ -114,11 +114,11 @@ impl Reply {
             Reply::SetConfig {
                 strategy,
                 default,
+                path,
                 config,
-                ..
             } => format!(
                 "Configuration updated with success: {}.{nl}Strategy in use: {strategy}{nl}Default: {}",
-                to_py_json(config),
+                to_py_json(&json!({"path": path, "data": config})),
                 py_bool(*default)
             ),
             Reply::Status(s) => {

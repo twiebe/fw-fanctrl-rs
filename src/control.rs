@@ -21,6 +21,8 @@ pub struct Tick {
     /// Speed to apply to the fan now.
     pub output: u8,
     pub critical: bool,
+    /// A sensor reached its EC "high" threshold (minus margin): fan at 100 %.
+    pub emergency: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,13 @@ impl Controller {
         }
     }
 
+    /// Forget history and output, e.g. after a pause or fail-safe: the conditions
+    /// may have changed completely, so the next tick starts at the curve target
+    /// instead of ramping from a stale value.
+    pub fn reset(&mut self) {
+        *self = Controller::new();
+    }
+
     /// Upstream: force a curve re-evaluation on the next tick (strategy change).
     /// The ramp continues from the current output, so there is no jump.
     pub fn reset_timecount(&mut self) {
@@ -72,13 +81,17 @@ impl Controller {
     }
 
     /// One control step. Upstream runs this once per second (`dt` = 1.0).
-    pub fn tick(&mut self, s: &Strategy, temp: f64, dt: f64) -> Tick {
+    /// `emergency` (any sensor near its EC limit, independent of the strategy's
+    /// sensor selection) forces 100 % without ramping.
+    pub fn tick(&mut self, s: &Strategy, temp: f64, dt: f64, emergency: bool) -> Tick {
         let avg = self.moving_average(s.moving_average_interval, temp);
         // Upstream: effective temp = min(moving average, current).
         let effective = round2(avg.min(temp));
-        let critical = s.ramp.critical_temp.is_some_and(|c| temp >= c);
+        let critical = emergency || s.ramp.critical_temp.is_some_and(|c| temp >= c);
 
-        if critical {
+        if emergency {
+            self.target = 100.0;
+        } else if critical {
             // Emergency: follow the raw temperature, re-evaluated every tick.
             self.target = s.target_speed(temp) as f64;
         } else if self.timecount.is_multiple_of(s.fan_speed_update_frequency) {
@@ -126,6 +139,7 @@ impl Controller {
             target: target as u8,
             output: out.round() as u8,
             critical,
+            emergency,
         }
     }
 }
@@ -157,7 +171,10 @@ mod tests {
     }
 
     fn run(c: &mut Controller, s: &Strategy, temps: &[f64]) -> Vec<u8> {
-        temps.iter().map(|t| c.tick(s, *t, 1.0).output).collect()
+        temps
+            .iter()
+            .map(|t| c.tick(s, *t, 1.0, false).output)
+            .collect()
     }
 
     #[test]
@@ -165,13 +182,13 @@ mod tests {
         let s = strategy(1, 1, Ramp::default());
         let mut c = Controller::new();
         // tick 1: no history → avg = current
-        assert_eq!(c.tick(&s, 60.0, 1.0).output, 40);
+        assert_eq!(c.tick(&s, 60.0, 1.0, false).output, 40);
         // tick 2: avg over last 1 reading = 60, current 80 → effective 60
-        assert_eq!(c.tick(&s, 80.0, 1.0).output, 40);
+        assert_eq!(c.tick(&s, 80.0, 1.0, false).output, 40);
         // tick 3: avg 80, current 80
-        assert_eq!(c.tick(&s, 80.0, 1.0).output, 80);
+        assert_eq!(c.tick(&s, 80.0, 1.0, false).output, 80);
         // drop: min(avg, current) reacts immediately downwards
-        assert_eq!(c.tick(&s, 50.0, 1.0).output, 20);
+        assert_eq!(c.tick(&s, 50.0, 1.0, false).output, 20);
     }
 
     #[test]
@@ -245,11 +262,11 @@ mod tests {
         let s = strategy(5, 30, ramp);
         let mut c = Controller::new();
         run(&mut c, &s, &[50.0; 10]); // 20 %
-        let t = c.tick(&s, 88.0, 1.0);
+        let t = c.tick(&s, 88.0, 1.0, false);
         assert!(t.critical);
         assert_eq!(t.output, 96); // raw 88°C on the curve, no ramp, no averaging
         // just below critical: averaging + ramp apply again, output holds
-        let t = c.tick(&s, 84.0, 1.0);
+        let t = c.tick(&s, 84.0, 1.0, false);
         assert!(!t.critical);
         assert_eq!(t.output, 96);
     }
@@ -269,6 +286,25 @@ mod tests {
         c.reset_timecount();
         let out = run(&mut c, &steep, &[50.0; 3]);
         assert_eq!(out, [22, 24, 26]);
+    }
+
+    #[test]
+    fn emergency_forces_full_speed_and_reset_forgets_state() {
+        let ramp = Ramp {
+            up_rate: Some(0.5),
+            down_rate: Some(0.2),
+            down_delay: 30.0,
+            ..Default::default()
+        };
+        let s = strategy(1, 20, ramp);
+        let mut c = Controller::new();
+        run(&mut c, &s, &[45.0; 10]); // 10 %
+        let t = c.tick(&s, 45.0, 1.0, true);
+        assert!(t.emergency && t.critical);
+        assert_eq!(t.output, 100);
+        // stale state after a pause: reset starts at the curve target of the new reading
+        c.reset();
+        assert_eq!(c.tick(&s, 85.0, 1.0, false).output, 90);
     }
 
     #[test]

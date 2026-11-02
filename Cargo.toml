@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Drop-in Rust reimplementation of fw-fanctrl with smooth (staggered) fan ramping"
 license = "BSD-3-Clause"
+rust-version = "1.88"
 
 [dependencies]
 libc = "0.2.191"

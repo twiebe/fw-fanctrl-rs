@@ -49,8 +49,12 @@ fn main() -> ExitCode {
     match run_local(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}", Reply::Error(e.0).natural());
-            ExitCode::FAILURE
+            eprintln!("{}", Reply::Error(e.0.clone()).natural());
+            if e.0 == daemon::ALREADY_RUNNING {
+                ExitCode::from(3) // RestartPreventExitStatus=3 in the unit
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

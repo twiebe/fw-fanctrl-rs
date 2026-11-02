@@ -11,10 +11,16 @@ ExecStopPost=@BINDIR@/fw-fanctrl restore-auto
 Restart=always
 RestartSec=2
 WatchdogSec=15
+# Exit code 3: another fw-fanctrl instance owns the socket. Don't retry: retrying
+# would eventually start a second controller next to it.
+RestartPreventExitStatus=3
 
 # Hardening: the service only needs /dev/cros_ec, its config and its socket.
 ConfigurationDirectory=fw-fanctrl
 RuntimeDirectory=fw-fanctrl
+# Keep /run/fw-fanctrl on stop/restart, so a failed start never deletes the socket
+# of another running instance.
+RuntimeDirectoryPreserve=yes
 DevicePolicy=closed
 DeviceAllow=/dev/cros_ec rw
 ProtectSystem=strict

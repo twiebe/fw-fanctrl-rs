@@ -12,6 +12,7 @@
 //!
 //! The fan is always handed back to the EC afterwards (drop guard, signals, panic hook).
 
+use std::cell::Cell;
 use std::fs;
 use std::hint::black_box;
 use std::os::unix::process::CommandExt;
@@ -157,22 +158,20 @@ impl Equilibrium {
         matches!((self.package_w, self.pl1_w), (Some(p), Some(l)) if l > 0.0 && p >= 0.9 * l)
     }
 
-    /// No thermal throttling at this duty.
+    /// No thermal throttling at this duty. All kernel signals are weak on their own
+    /// (both throttle counters only advance when an episode starts or ends, so a CPU
+    /// held at TjMax for the whole window can show no change), so they are combined:
+    /// any of them counts as throttling.
     pub fn ok(&self) -> bool {
         if self.guard_hit {
             return false;
         }
-        // Best signal: accumulated throttle time (allow 1 % of the window).
-        if let Some(ms) = self.throttle_ms {
-            return ms <= 600;
-        }
-        if self.throttle_events.is_some_and(|n| n > 0) {
-            return false;
-        }
-        // A package sitting near TjMax while drawing less than PL1 is held back
-        // by temperature. Without RAPL, near-TjMax alone counts as throttling.
-        let hot = self.spiky_max.is_some_and(|t| t >= 95.0);
-        !(hot && !self.power_limited())
+        // A package near TjMax while drawing less than PL1 is held back by temperature.
+        let hot = self.spiky_max.is_some_and(|t| t >= 90.0);
+        let throttled = self.throttle_ms.is_some_and(|ms| ms > 600)
+            || self.throttle_events.is_some_and(|n| n > 0)
+            || (hot && !self.power_limited());
+        !throttled
     }
 }
 
@@ -310,14 +309,24 @@ impl Load {
             })
             .collect();
         let child = match cmd {
-            Some(c) => Some(
-                Command::new("sh")
-                    .arg("-c")
-                    .arg(c)
-                    .process_group(0)
-                    .spawn()
-                    .map_err(|e| Error(format!("cannot start --load-cmd: {e}")))?,
-            ),
+            Some(c) => {
+                let argv = split_load_cmd(c)?;
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]).process_group(0);
+                // SAFETY: prctl is async-signal-safe; the child gets SIGTERM if we die
+                // (e.g. SIGKILL), so a load cannot outlive the calibration.
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        Ok(())
+                    });
+                }
+                Some(
+                    command
+                        .spawn()
+                        .map_err(|e| Error(format!("cannot start --load-cmd: {e}")))?,
+                )
+            }
             None => None,
         };
         Ok(Load {
@@ -413,6 +422,16 @@ fn rpm(ec: &CrosEc) -> u16 {
     }
 }
 
+/// `--load-cmd` is split like a shell would (quotes), but not run through a shell,
+/// so the death signal reaches the program itself. Use `sh -c '...'` explicitly
+/// for pipelines.
+fn split_load_cmd(cmd: &str) -> Result<Vec<String>> {
+    match shlex::split(cmd) {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => bail!("--load-cmd: cannot parse '{cmd}'"),
+    }
+}
+
 fn interrupted() -> Result<()> {
     if signals::take().is_some() {
         bail!("calibration interrupted");
@@ -423,6 +442,17 @@ fn interrupted() -> Result<()> {
 struct Sampler<'a> {
     ec: &'a CrosEc,
     infos: &'a [SensorInfo],
+    /// Last lease renewal, if the service is paused for us.
+    lease: Option<Cell<Instant>>,
+}
+
+/// The service is paused with a lease; if this process dies, the service takes
+/// over again after at most this long.
+const LEASE_SECS: u64 = 30;
+const LEASE_RENEW: Duration = Duration::from_secs(10);
+
+fn pause_service() -> Result<String> {
+    daemon::send_command(&["pause".into(), "--lease".into(), LEASE_SECS.to_string()])
 }
 
 impl Sampler<'_> {
@@ -431,6 +461,14 @@ impl Sampler<'_> {
     fn sample(&self) -> Result<(Vec<Option<f64>>, bool)> {
         std::thread::sleep(Duration::from_secs(1));
         interrupted()?;
+        if let Some(last) = &self.lease
+            && last.get().elapsed() >= LEASE_RENEW
+        {
+            if let Err(e) = pause_service() {
+                eprintln!("[Warning] > renewing the service pause failed: {e}");
+            }
+            last.set(Instant::now());
+        }
         let temps: Vec<Option<f64>> = self
             .ec
             .temperatures()?
@@ -458,25 +496,41 @@ fn max_of(row: &[Option<f64>], idx: &[usize]) -> Option<(f64, usize)> {
 }
 
 pub fn run(opts: &Options) -> Result<()> {
-    if let Some(name) = &opts.apply
-        && !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        bail!("invalid strategy name '{name}' (allowed: a-z, A-Z, 0-9, _ and -)");
+    // Everything that can be checked up front is checked before 10-20 minutes of load.
+    if let Some(name) = &opts.apply {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            bail!("invalid strategy name '{name}' (allowed: a-z, A-Z, 0-9, _ and -)");
+        }
+        let cfg = Config::load(&opts.config)?;
+        if cfg.strategy(name).is_some() {
+            eprintln!(
+                "[Warning] > strategy '{name}' exists in {} and will be replaced (a backup is kept)",
+                opts.config.display()
+            );
+        }
     }
-    // Fail early if the config cannot take the result.
-    if opts.apply.is_some() {
-        Config::load(&opts.config)?;
+    if let Some(c) = &opts.load_cmd {
+        split_load_cmd(c)?;
     }
 
     let ec = CrosEc::open()?;
     signals::install();
-    let service_paused = daemon::send_command(&["pause".to_string()]).is_ok();
+    let service_paused = match pause_service() {
+        Ok(resp) if resp.starts_with("[Error] > ") => {
+            let _ = daemon::send_command(&["resume".to_string()]);
+            bail!("the running fw-fanctrl service could not hand control to the EC: {resp}");
+        }
+        Ok(_) => true,
+        Err(_) => false, // no service running
+    };
     if service_paused {
-        eprintln!("fw-fanctrl service paused for the calibration");
+        eprintln!("fw-fanctrl service paused for the calibration (lease {LEASE_SECS} s, renewed)");
     }
-    let result = measure(&ec, opts);
+    let result = measure(&ec, opts, service_paused);
     if service_paused {
         if let (Ok(_), Some(_)) = (&result, &opts.apply) {
             let _ = daemon::send_command(&["reload".to_string()]);
@@ -487,7 +541,7 @@ pub fn run(opts: &Options) -> Result<()> {
     result
 }
 
-fn measure(ec: &CrosEc, opts: &Options) -> Result<()> {
+fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     let mut guard = Guard { ec, load: None };
     let started = Instant::now();
     let step = |n: u8, what: &str| eprintln!("\n[{n}/5] {what}");
@@ -522,7 +576,11 @@ fn measure(ec: &CrosEc, opts: &Options) -> Result<()> {
             f(t.fan_max)
         );
     }
-    let sampler = Sampler { ec, infos: &infos };
+    let sampler = Sampler {
+        ec,
+        infos: &infos,
+        lease: service_paused.then(|| Cell::new(Instant::now())),
+    };
 
     // 2. fan sweep
     step(2, "fan sweep (duty → RPM)");
@@ -892,36 +950,31 @@ mod tests {
     }
 
     #[test]
-    fn throttle_judgement() {
+    fn throttle_judgement_combines_all_signals() {
+        // cool package, no counters moving
         let mut e = eq(30, 60.0);
-        // throttle time is authoritative
+        e.spiky_max = Some(85.0);
         assert!(e.ok());
-        e.throttle_ms = Some(601);
-        assert!(!e.ok());
-        e.throttle_ms = Some(500);
-        e.throttle_events = Some(3); // events are ignored when time is available
-        assert!(e.ok());
-
-        // without throttle time: a static event counter is not proof (continuous throttling)
-        e.throttle_ms = None;
-        e.throttle_events = Some(0);
-        assert!(
-            !e.ok(),
-            "96 °C package below PL1 (20 of 28 W) is thermally limited"
-        );
-        e.package_w = Some(27.0);
-        assert!(
-            e.ok(),
-            "at PL1 the CPU is power limited, more fan would not help"
-        );
-        e.throttle_events = Some(1);
-        assert!(!e.ok());
-
-        // no RAPL, no counters (e.g. some AMD setups): near-TjMax counts as throttling
+        // each signal on its own marks the duty as thermally limited
+        let mut t = e.clone();
+        t.throttle_ms = Some(601);
+        assert!(!t.ok());
+        let mut t = e.clone();
+        t.throttle_events = Some(1);
+        assert!(!t.ok());
+        // the case from the Framework 13 Pro: counters static, package at 96 °C,
+        // power below PL1 → held back by temperature
+        let mut t = e.clone();
+        t.spiky_max = Some(96.0);
+        assert!(!t.ok());
+        // same temperature at PL1: power-limited, more fan would not help
+        t.package_w = Some(27.0);
+        assert!(t.ok());
+        // no RAPL, no counters: near-TjMax counts as throttling
         let mut a = eq(30, 60.0);
         (a.throttle_ms, a.throttle_events, a.package_w, a.pl1_w) = (None, None, None, None);
         assert!(!a.ok());
-        a.spiky_max = Some(90.0);
+        a.spiky_max = Some(89.0);
         assert!(a.ok());
         a.guard_hit = true;
         assert!(!a.ok());

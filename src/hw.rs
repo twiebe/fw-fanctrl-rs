@@ -16,6 +16,22 @@ pub trait Hardware: Send {
     fn fans(&mut self) -> Result<Vec<Fan>>;
     /// True if this backend touches real hardware with writes.
     fn is_live(&self) -> bool;
+    /// EC "high" threshold in °C per sensor index for the first `n` sensors
+    /// (`None` = unknown or disabled).
+    fn high_thresholds(&mut self, _n: usize) -> Vec<Option<f64>> {
+        Vec::new()
+    }
+}
+
+fn ec_high_thresholds(ec: &CrosEc, n: usize) -> Vec<Option<f64>> {
+    (0..n.min(255))
+        .map(|i| {
+            ec.thresholds(i as u8)
+                .ok()
+                .and_then(|t| t.high)
+                .map(f64::from)
+        })
+        .collect()
 }
 
 fn to_f64(temps: Vec<Option<i32>>) -> Vec<Option<f64>> {
@@ -60,6 +76,9 @@ impl Hardware for Ec {
     fn is_live(&self) -> bool {
         true
     }
+    fn high_thresholds(&mut self, n: usize) -> Vec<Option<f64>> {
+        ec_high_thresholds(&self.0, n)
+    }
 }
 
 /// Reads from the real EC, but only logs writes.
@@ -85,6 +104,9 @@ impl Hardware for DryRun {
     }
     fn is_live(&self) -> bool {
         false
+    }
+    fn high_thresholds(&mut self, n: usize) -> Vec<Option<f64>> {
+        ec_high_thresholds(&self.0, n)
     }
 }
 
