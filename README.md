@@ -26,7 +26,7 @@ Each strategy may additionally define:
 | `rampDownRate`  | %/s  | instant    | Maximum decrease of the fan duty per second. |
 | `rampDownDelay` | s    | `0`        | How long the target has to stay below the current speed before the fan starts slowing down. Short load drops are ignored. |
 | `criticalTemp`  | °C   | none       | At or above this *raw* temperature (of the selected sensors), averaging and ramp-up limiting are bypassed and the fan goes straight to the curve value. |
-| `minSpeed`      | %    | none       | Lowest duty the fan reliably runs at. Duties between 0 and this are never sent. From standstill the fan starts only once the target reaches `minSpeed`, and then jumps straight to it. A running fan stays at `minSpeed` until the target is 0. Background: the EC only kick-starts the fan when leaving 0 %, so a ramp through 1–9 % leaves it stalled until a much higher duty. |
+| `minSpeed`      | %    | none       | Lowest duty the fan reliably runs at. Duties between 0 and this are never sent. From standstill the fan starts only once the target reaches `minSpeed`, and then jumps straight to it. A running fan stays at `minSpeed` until the target is 0, and once off it stays off for at least 3 s. Background: the EC only kick-starts the fan when leaving 0 %, so a ramp through 1–9 % leaves it stalled until a much higher duty. |
 | `sensors`       | list | all        | EC sensor indices whose maximum drives the curve, e.g. `[0, 1, 3]`. Indices are those shown by `fw-fanctrl probe` and `framework_tool --thermalget`. |
 
 A strategy without these keys behaves exactly like upstream. Example (also shipped as
@@ -120,8 +120,9 @@ warm side. A running service is paused for the duration and resumed afterwards. 
 
 1. **Sensors:** Reads the EC sensor names and thermal thresholds.
 2. **Fan:** Measures the duty that starts the fan, jumping from 0 % with the fan at rest
-   each time (the EC only kick-starts it when leaving 0 %), and the lowest duty a running fan
-   keeps turning at. The higher of the two becomes `minSpeed`. Then it maps duty to RPM.
+   each time (the EC only kick-starts it when leaving 0 %). The fan has to *keep* turning
+   after the start-up kick is over, not just spin briefly. It also measures the lowest duty
+   a running fan keeps turning at. The higher of the two becomes `minSpeed`. Then it maps duty to RPM.
 3. **Idle baseline:** Records every sensor while the machine is idle.
 4. **Load step:** Classifies the sensors. *Board* sensors react slowly and drive the curve.
    *Spiky* sensors (the CPU package) and sensors the EC itself ignores for fan control are
@@ -200,6 +201,10 @@ conditions change a lot (summer, docked with the lid closed, and so on).
 - **Fresh start after pause and fail-safe:** On `resume` and on recovery the controller
   forgets its history and starts at the curve value for the current readings. A machine that
   heated up meanwhile does not get a slow ramp from the old value.
+- **Stall detection:** If the fan reports 0 RPM for 5 s while it is driven at `minSpeed`
+  or more (15 % without `minSpeed`), the service holds 0 % for 3 s and starts it again, so
+  the EC gives it a start-up kick. After 3 failed restarts in a row the EC takes over for
+  10 minutes before the service tries again.
 - **Global emergency guard:** If *any* sensor, selected in `sensors` or not, comes within
   3 °C of its EC `high` threshold, the fan goes to 100 % at once.
 - **Second instance:** If another fw-fanctrl owns the socket, the service exits with code 3

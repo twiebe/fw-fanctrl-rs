@@ -583,11 +583,31 @@ fn wait_rpm(ec: &CrosEc, sampler: &Sampler, done: impl Fn(u16) -> bool, secs: u3
     Ok(r)
 }
 
-/// 0 % and wait until the fan has stopped (up to 30 s).
+/// 0 % until the fan has stopped (up to 30 s), then hold 0 % a little longer:
+/// the EC only kick-starts the fan on the next start if it has seen 0 % for a
+/// moment. (A stalled fan already reads 0 RPM, so "stopped" alone is not enough.)
 fn stop_fan(ec: &CrosEc, sampler: &Sampler) -> Result<()> {
     ec.send(EcCommand::SetFanDuty(0))?;
     wait_rpm(ec, sampler, |r| r == 0, 30)?;
+    for _ in 0..crate::control::MIN_OFF_SECS as u32 + 1 {
+        sampler.sample()?;
+    }
     Ok(())
+}
+
+/// After a start from 0 %: does the fan keep turning once the EC's start-up kick
+/// is over? Returns the RPM after 8 s, or 0 if it stalled at any point after the
+/// first 4 s.
+fn runs_after_start(ec: &CrosEc, sampler: &Sampler) -> Result<u16> {
+    let mut r = 0;
+    for i in 0..8 {
+        sampler.sample()?;
+        r = rpm(ec);
+        if i >= 4 && r == 0 {
+            return Ok(0);
+        }
+    }
+    Ok(r)
 }
 
 /// RPM once it is stable (two readings within 2 %, at most 15 s).
@@ -861,13 +881,13 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     for d in [5u8, 7, 10, 12, 15, 20, 25, 30] {
         stop_fan(ec, &sampler)?;
         ec.send(EcCommand::SetFanDuty(d))?;
-        let r = wait_rpm(ec, &sampler, |r| r > 0, 8)?;
+        let r = runs_after_start(ec, &sampler)?;
         eprintln!(
             "  0 → {d:>2}%: {}",
             if r > 0 {
-                format!("starts ({r} RPM)")
+                format!("starts and keeps running ({r} RPM)")
             } else {
-                "stays off".into()
+                "does not keep running".into()
             }
         );
         if r > 0 {

@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 use crate::config::Strategy;
 
 const HISTORY_LEN: usize = 100;
+/// With `minSpeed`: once off, stay off at least this long. The EC only kick-starts
+/// the fan if it has seen 0 % for a moment; a quick off → on would leave it stalled.
+pub const MIN_OFF_SECS: f64 = 3.0;
 
 pub fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
@@ -33,6 +36,8 @@ pub struct Controller {
     output: Option<f64>,
     /// Seconds the target has been continuously below the output.
     below_for: f64,
+    /// Seconds the output has been 0.
+    off_for: f64,
 }
 
 impl Default for Controller {
@@ -49,6 +54,7 @@ impl Controller {
             target: 0.0,
             output: None,
             below_for: 0.0,
+            off_for: MIN_OFF_SECS, // unknown history: allow an immediate start
         }
     }
 
@@ -128,9 +134,22 @@ impl Controller {
             }
         };
         let out = match s.ramp.min_speed {
-            Some(min) => apply_min_speed(out, target, prev, min as f64),
+            Some(min) => {
+                let out = apply_min_speed(out, target, prev, min as f64);
+                let just_stopped = prev.is_some_and(|p| p <= 0.0) && self.off_for < MIN_OFF_SECS;
+                if out > 0.0 && just_stopped && !critical {
+                    0.0
+                } else {
+                    out
+                }
+            }
             None => out,
         };
+        if out <= 0.0 {
+            self.off_for += dt;
+        } else {
+            self.off_for = 0.0;
+        }
         self.output = Some(out);
 
         self.history.pop_front();
@@ -347,6 +366,8 @@ mod tests {
         assert_eq!(run(&mut c, &s, &[43.0, 43.0, 43.0, 43.0]), [11, 10, 10, 10]);
         // target 0: off without passing through the stall band
         assert_eq!(run(&mut c, &s, &[40.0]), [0]);
+        // restarting right away is held off for MIN_OFF_SECS (EC needs to see 0 %)
+        assert_eq!(run(&mut c, &s, &[50.0, 50.0, 50.0, 50.0]), [0, 0, 10, 11]);
         // without minSpeed the ramp walks through the band
         let plain = strategy(
             1,

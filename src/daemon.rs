@@ -36,6 +36,14 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const TICK: Duration = Duration::from_secs(1);
 /// Emergency margin below a sensor's EC "high" threshold.
 const EMERGENCY_MARGIN: f64 = 3.0;
+/// Fan at >= minSpeed (or 15 %) but 0 RPM for this many ticks counts as stalled.
+const STALL_TICKS: u32 = 5;
+/// A stalled fan is restarted by holding 0 % this long (the EC kick-starts it when
+/// leaving 0 %).
+const RESTART_HOLD: Duration = Duration::from_secs(3);
+/// After this many failed restarts in a row the EC takes over for a while.
+const MAX_RESTARTS: u32 = 3;
+const STALL_BACKOFF_SECS: u64 = 600;
 
 pub struct Service {
     config: Config,
@@ -58,6 +66,10 @@ pub struct Service {
     pause_until: Option<Instant>,
     /// EC "high" threshold per sensor index, read once the sensors are known.
     limits: Option<Vec<Option<f64>>>,
+    stall_ticks: u32,
+    restarts: u32,
+    /// Holding 0 % to restart a stalled fan until then.
+    restart_until: Option<Instant>,
 }
 
 impl Service {
@@ -85,6 +97,9 @@ impl Service {
             need_auto: false,
             pause_until: None,
             limits: None,
+            stall_ticks: 0,
+            restarts: 0,
+            restart_until: None,
         };
         if let Ok(ac) = svc.hw.on_ac() {
             svc.on_ac = ac;
@@ -166,6 +181,8 @@ impl Service {
 
     fn resume(&mut self) {
         self.active = true;
+        self.stall_ticks = 0;
+        self.restart_until = None;
         self.pause_until = None;
         self.need_auto = false;
         self.force_write = true;
@@ -221,6 +238,11 @@ impl Service {
         }
         self.last = tick;
 
+        if self.handle_stall(&strategy) {
+            self.failures = 0;
+            return; // restart in progress or EC took over
+        }
+
         let due = self.force_write
             || self
                 .last_write
@@ -237,6 +259,57 @@ impl Service {
             self.failsafe = false;
         }
         self.failures = 0;
+    }
+
+    /// Detect a fan that does not turn although we drive it, and restart it.
+    /// Returns true if the normal write must be skipped this tick.
+    fn handle_stall(&mut self, strategy: &Strategy) -> bool {
+        if let Some(until) = self.restart_until {
+            if Instant::now() < until {
+                return true; // keep holding 0 %
+            }
+            self.restart_until = None;
+            self.force_write = true; // re-apply the duty from 0 % → kick-start
+            return false;
+        }
+        let threshold = strategy.ramp.min_speed.unwrap_or(15);
+        let driven = self.last_write.is_some_and(|(v, _)| v >= threshold);
+        let turning = self.fans.iter().any(|f| matches!(f, Fan::Rpm(r) if *r > 0));
+        if self.fans.is_empty() || !driven || turning {
+            self.stall_ticks = 0;
+            if turning {
+                self.restarts = 0;
+            }
+            return false;
+        }
+        self.stall_ticks += 1;
+        if self.stall_ticks < STALL_TICKS {
+            return false;
+        }
+        self.stall_ticks = 0;
+        self.restarts += 1;
+        if self.restarts > MAX_RESTARTS {
+            eprintln!(
+                "[Error] > fan does not turn after {MAX_RESTARTS} restarts: EC automatic control for {} min",
+                STALL_BACKOFF_SECS / 60
+            );
+            self.restarts = 0;
+            let _ = self.pause(Some(STALL_BACKOFF_SECS));
+            return true;
+        }
+        eprintln!(
+            "[Warning] > fan stalled at {}%: restarting it ({}/{MAX_RESTARTS})",
+            self.last_write.map_or(0, |(v, _)| v),
+            self.restarts
+        );
+        match self.hw.set_speed(0) {
+            Ok(()) => {
+                self.last_write = Some((0, Instant::now()));
+                self.restart_until = Some(Instant::now() + RESTART_HOLD);
+            }
+            Err(e) => self.fail(format!("setting fan speed failed: {e}")),
+        }
+        true
     }
 
     pub fn status(&self) -> Status {
@@ -589,6 +662,8 @@ mod tests {
         /// number of upcoming auto_fan() calls that fail
         fail_auto: Arc<Mutex<u32>>,
         high: Option<f64>,
+        /// None = no fan reported; Some(rpm) = fixed reading
+        fan: Arc<Mutex<Option<u16>>>,
     }
 
     impl Hardware for Mock {
@@ -623,7 +698,7 @@ mod tests {
             Ok(true)
         }
         fn fans(&mut self) -> Result<Vec<Fan>> {
-            Ok(vec![])
+            Ok(self.fan.lock().unwrap().map(Fan::Rpm).into_iter().collect())
         }
         fn is_live(&self) -> bool {
             false
@@ -638,13 +713,16 @@ mod tests {
         log: Arc<Mutex<Vec<String>>>,
         temps: Arc<Mutex<Vec<Result<f64>>>>,
         fail_auto: Arc<Mutex<u32>>,
+        fan: Arc<Mutex<Option<u16>>>,
     }
 
     fn fixture(temps: Vec<Result<f64>>, fail_set: bool, high: Option<f64>) -> Fixture {
         let log = Arc::new(Mutex::new(vec![]));
         let temps = Arc::new(Mutex::new(temps));
         let fail_auto = Arc::new(Mutex::new(0));
+        let fan = Arc::new(Mutex::new(None));
         let hw = Mock {
+            fan: Arc::clone(&fan),
             temps: Arc::clone(&temps),
             log: Arc::clone(&log),
             fail_set,
@@ -663,6 +741,7 @@ mod tests {
             log,
             temps,
             fail_auto,
+            fan,
         }
     }
 
@@ -832,6 +911,43 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["auto", "set 15"]);
         assert!(answer(&s, "run", user).starts_with("[Error] >"));
         assert!(answer(&s, "set_config '{broken'", Some(0)).starts_with("[Error] >"));
+    }
+
+    #[test]
+    fn stalled_fan_is_restarted_then_handed_to_the_ec() {
+        // lazy at 60 °C → 21 %, but the fan reports 0 RPM
+        let mut f = fixture(vec![Ok(60.0)], false, None);
+        *f.fan.lock().unwrap() = Some(0);
+        // first tick writes 21 %, then STALL_TICKS ticks without rotation
+        for _ in 0..=STALL_TICKS {
+            f.svc.tick();
+        }
+        assert_eq!(*f.log.lock().unwrap(), ["set 21", "set 0"]);
+        f.svc.tick(); // holding 0 %
+        assert_eq!(f.log.lock().unwrap().len(), 2);
+        f.svc.restart_until = Some(Instant::now()); // hold time over
+        f.svc.tick();
+        assert_eq!(f.log.lock().unwrap().last().unwrap(), "set 21");
+        // fan turns again → counters reset, nothing else happens
+        *f.fan.lock().unwrap() = Some(1900);
+        for _ in 0..10 {
+            f.svc.tick();
+        }
+        assert_eq!(f.log.lock().unwrap().len(), 3);
+        assert_eq!(f.svc.restarts, 0);
+
+        // permanently stalled: three restarts, then EC auto with a lease
+        *f.fan.lock().unwrap() = Some(0);
+        for _ in 0..4 {
+            for _ in 0..STALL_TICKS {
+                f.svc.tick();
+            }
+            f.svc.restart_until = f.svc.restart_until.map(|_| Instant::now());
+            f.svc.tick();
+        }
+        assert!(!f.svc.active);
+        assert!(f.svc.pause_until.is_some());
+        assert_eq!(f.log.lock().unwrap().last().unwrap(), "auto");
     }
 
     #[test]
