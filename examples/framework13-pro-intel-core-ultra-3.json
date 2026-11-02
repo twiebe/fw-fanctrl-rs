@@ -22,7 +22,8 @@
             "rampUpRate": 0.5,
             "rampDownRate": 0.2,
             "rampDownDelay": 30,
-            "criticalTemp": 80
+            "criticalTemp": 80,
+            "minSpeed": 10
         }
     }
 }

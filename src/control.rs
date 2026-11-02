@@ -100,6 +100,7 @@ impl Controller {
         }
 
         let target = self.target;
+        let prev = self.output;
         let out = match self.output {
             None => target, // first tick: start at the target, nothing to ramp from
             Some(cur) if target > cur => {
@@ -126,6 +127,10 @@ impl Controller {
                 cur
             }
         };
+        let out = match s.ramp.min_speed {
+            Some(min) => apply_min_speed(out, target, prev, min as f64),
+            None => out,
+        };
         self.output = Some(out);
 
         self.history.pop_front();
@@ -141,6 +146,22 @@ impl Controller {
             critical,
             emergency,
         }
+    }
+}
+
+/// Keep the output out of the band (0, min): from standstill only start once the
+/// target reaches `min` (and then jump to it); while running never go below `min`
+/// unless the target is 0.
+fn apply_min_speed(out: f64, target: f64, prev: Option<f64>, min: f64) -> f64 {
+    let was_off = prev.is_none_or(|p| p <= 0.0);
+    if out <= 0.0 {
+        0.0
+    } else if was_off {
+        if target >= min { out.max(min) } else { 0.0 }
+    } else if out < min {
+        if target > 0.0 { min } else { 0.0 }
+    } else {
+        out
     }
 }
 
@@ -305,6 +326,38 @@ mod tests {
         // stale state after a pause: reset starts at the curve target of the new reading
         c.reset();
         assert_eq!(c.tick(&s, 85.0, 1.0, false).output, 90);
+    }
+
+    #[test]
+    fn min_speed_skips_the_stall_band() {
+        let ramp = Ramp {
+            up_rate: Some(1.0),
+            down_rate: Some(1.0),
+            min_speed: Some(10),
+            ..Default::default()
+        };
+        let s = strategy(1, 1, ramp);
+        let mut c = Controller::new();
+        // 40 °C → target 0: off. 43 °C → target 6 (< min): stays off
+        assert_eq!(run(&mut c, &s, &[40.0, 43.0, 43.0]), [0, 0, 0]);
+        // 46 °C → target 12 (one tick later, upstream's min(avg, current)): start,
+        // jumping straight to 10 instead of ramping 1, 2, 3 …
+        assert_eq!(run(&mut c, &s, &[46.0, 46.0, 46.0, 46.0]), [0, 10, 11, 12]);
+        // back to a target of 6: ramp down, then hold 10 while the target is > 0
+        assert_eq!(run(&mut c, &s, &[43.0, 43.0, 43.0, 43.0]), [11, 10, 10, 10]);
+        // target 0: off without passing through the stall band
+        assert_eq!(run(&mut c, &s, &[40.0]), [0]);
+        // without minSpeed the ramp walks through the band
+        let plain = strategy(
+            1,
+            1,
+            Ramp {
+                up_rate: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let mut c = Controller::new();
+        assert_eq!(run(&mut c, &plain, &[40.0, 46.0, 46.0]), [0, 0, 1]);
     }
 
     #[test]

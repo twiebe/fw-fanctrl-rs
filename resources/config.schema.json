@@ -156,6 +156,12 @@
                         "maximum": 23
                     },
                     "description": "fw-fanctrl-rs: EC temperature sensor indices (as shown by `fw-fanctrl probe` / `framework_tool --thermalget`) whose maximum drives the curve. Omit to use all sensors (upstream behaviour)."
+                },
+                "minSpeed": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "fw-fanctrl-rs: lowest duty (percent) the fan reliably runs at. Duties between 0 and this are never sent: starting jumps straight to it (the EC only kick-starts the fan when leaving 0 %), and a running fan stays at it until the target is 0."
                 }
             },
             "required": [

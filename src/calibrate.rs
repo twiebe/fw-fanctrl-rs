@@ -201,8 +201,8 @@ impl Equilibrium {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurveInput {
     pub idle_temp: f64,
-    /// Lowest duty that starts the fan from standstill.
-    pub start_duty: u8,
+    /// Lowest duty the fan starts at from 0 % and keeps running at (→ `minSpeed`).
+    pub min_speed: u8,
     pub anchor: Equilibrium,
     /// EC thresholds of the dominant sensor.
     pub dominant_thresholds: Option<Thresholds>,
@@ -220,7 +220,7 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
         Prefer::Balanced => (3.0, 1.3, 1.0, 0.3, 20),
         Prefer::Cool => (2.0, 1.7, 2.0, 0.5, 10),
     };
-    let floor = (c.start_duty + 2).clamp(5, 40);
+    let floor = c.min_speed.clamp(5, 40);
     let anchor_duty = ((c.anchor.duty as f64 * factor).round() as u8).clamp(floor + 1, 100);
     let anchor_t = c.anchor.board_temp.floor();
     let idle = c.idle_temp.round();
@@ -281,6 +281,7 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
         "rampDownRate": down,
         "rampDownDelay": delay,
         "criticalTemp": critical,
+        "minSpeed": floor,
     })
 }
 
@@ -569,6 +570,46 @@ fn max_of(row: &[Option<f64>], idx: &[usize]) -> Option<(f64, usize)> {
         .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
+/// Wait (up to `secs`) until the RPM satisfies `done`; returns the last RPM.
+fn wait_rpm(ec: &CrosEc, sampler: &Sampler, done: impl Fn(u16) -> bool, secs: u32) -> Result<u16> {
+    let mut r = rpm(ec);
+    for _ in 0..secs {
+        if done(r) {
+            break;
+        }
+        sampler.sample()?;
+        r = rpm(ec);
+    }
+    Ok(r)
+}
+
+/// 0 % and wait until the fan has stopped (up to 30 s).
+fn stop_fan(ec: &CrosEc, sampler: &Sampler) -> Result<()> {
+    ec.send(EcCommand::SetFanDuty(0))?;
+    wait_rpm(ec, sampler, |r| r == 0, 30)?;
+    Ok(())
+}
+
+/// RPM once it is stable (two readings within 2 %, at most 15 s).
+fn stable_rpm(ec: &CrosEc, sampler: &Sampler) -> Result<u16> {
+    let (mut prev, mut stable, mut r) = (0u16, 0, 0);
+    for i in 0..15 {
+        sampler.sample()?;
+        r = rpm(ec);
+        let tol = (prev as f64 * 0.02).max(30.0);
+        stable = if i >= 2 && (r as f64 - prev as f64).abs() <= tol {
+            stable + 1
+        } else {
+            0
+        };
+        prev = r;
+        if stable >= 2 {
+            break;
+        }
+    }
+    Ok(r)
+}
+
 struct Groups<'a> {
     board: &'a [usize],
     spiky: &'a [usize],
@@ -809,43 +850,62 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         lease: service_paused.then(|| Cell::new(Instant::now())),
     };
 
-    // 2. fan sweep
-    step(2, "fan sweep (duty → RPM)");
-    ec.send(EcCommand::SetFanDuty(0))?;
-    for _ in 0..20 {
-        if rpm(ec) == 0 {
+    // 2. fan: start from standstill, lowest running duty, duty → RPM
+    step(
+        2,
+        "fan: start from standstill, lowest running duty, duty → RPM",
+    );
+    // The EC only kick-starts the fan when leaving 0 %, so every start attempt
+    // begins at 0 % with the fan at rest.
+    let mut start = None;
+    for d in [5u8, 7, 10, 12, 15, 20, 25, 30] {
+        stop_fan(ec, &sampler)?;
+        ec.send(EcCommand::SetFanDuty(d))?;
+        let r = wait_rpm(ec, &sampler, |r| r > 0, 8)?;
+        eprintln!(
+            "  0 → {d:>2}%: {}",
+            if r > 0 {
+                format!("starts ({r} RPM)")
+            } else {
+                "stays off".into()
+            }
+        );
+        if r > 0 {
+            start = Some(d);
             break;
         }
-        sampler.sample()?;
     }
-    let mut fan_map: Vec<(u8, u16)> = Vec::new();
-    for duty in [3u8, 5, 7, 10, 15, 20, 25, 30, 40, 50, 60, 80, 100] {
-        ec.send(EcCommand::SetFanDuty(duty))?;
-        let mut prev = 0u16;
-        let mut stable = 0;
-        let mut r = 0;
-        for i in 0..15 {
-            sampler.sample()?;
-            r = rpm(ec);
-            let tol = (prev as f64 * 0.02).max(30.0);
-            stable = if i >= 2 && (r as f64 - prev as f64).abs() <= tol {
-                stable + 1
-            } else {
-                0
-            };
-            prev = r;
-            if stable >= 2 {
-                break;
-            }
+    let start = start.unwrap_or(30);
+    // Once running, it may keep going at lower duties.
+    ec.send(EcCommand::SetFanDuty(20))?;
+    stable_rpm(ec, &sampler)?;
+    let mut lowest_running = 20;
+    for d in [15u8, 12, 10, 8, 6, 5, 4, 3] {
+        ec.send(EcCommand::SetFanDuty(d))?;
+        let r = stable_rpm(ec, &sampler)?;
+        eprintln!("  running at {d:>2}%: {r} RPM");
+        if r == 0 {
+            break;
         }
-        eprintln!("  {duty:>3}% → {r} RPM");
-        fan_map.push((duty, r));
+        lowest_running = d;
     }
-    let start_duty = fan_map.iter().find(|(_, r)| *r > 0).map_or(10, |(d, _)| *d);
-    eprintln!("  fan starts at {start_duty}% from standstill");
+    let min_speed = start.max(lowest_running);
+    eprintln!(
+        "  minSpeed {min_speed}% (starts from 0 % at {start}%, keeps running down to {lowest_running}%)"
+    );
+    stop_fan(ec, &sampler)?;
+    let mut map_duties = vec![min_speed, 15, 20, 25, 30, 40, 50, 60, 80, 100];
+    map_duties.retain(|d| *d >= min_speed);
+    map_duties.sort_unstable();
+    map_duties.dedup();
+    for duty in map_duties {
+        ec.send(EcCommand::SetFanDuty(duty))?;
+        let r = stable_rpm(ec, &sampler)?;
+        eprintln!("  {duty:>3}% → {r} RPM");
+    }
 
     // 3. idle baseline
-    let test_duty = start_duty.max(20);
+    let test_duty = min_speed.max(20);
     step(3, &format!("idle baseline at {test_duty}% (40 s)"));
     ec.send(EcCommand::SetFanDuty(test_duty))?;
     let mut idle_rows = Vec::new();
@@ -916,8 +976,8 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     let mut reference = hold(ec, &sampler, &groups, 100, None)?;
     reference.ref_mhz = reference.mhz;
     report("reference", &reference);
-    let mut duties: Vec<u8> = vec![start_duty, 20, 30, 40, 55, 75];
-    duties.retain(|d| *d >= start_duty && *d < 100);
+    let mut duties: Vec<u8> = vec![min_speed, 20, 30, 40, 55, 75];
+    duties.retain(|d| *d >= min_speed && *d < 100);
     duties.sort_unstable();
     duties.dedup();
     let mut anchor = None;
@@ -962,7 +1022,7 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         .unwrap_or(40.0);
     let input = CurveInput {
         idle_temp,
-        start_duty,
+        min_speed,
         dominant_thresholds: infos
             .iter()
             .find(|i| i.index == anchor.dominant)
@@ -1083,7 +1143,7 @@ mod tests {
     fn input() -> CurveInput {
         CurveInput {
             idle_temp: 40.2,
-            start_duty: 6,
+            min_speed: 8,
             anchor: eq(30, 66.7),
             dominant_thresholds: Some(Thresholds {
                 high: Some(88),

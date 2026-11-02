@@ -26,6 +26,7 @@ Each strategy may additionally define:
 | `rampDownRate`  | %/s  | instant    | Maximum decrease of the fan duty per second. |
 | `rampDownDelay` | s    | `0`        | How long the target has to stay below the current speed before the fan starts slowing down. Short load drops are ignored. |
 | `criticalTemp`  | °C   | none       | At or above this *raw* temperature (of the selected sensors), averaging and ramp-up limiting are bypassed and the fan goes straight to the curve value. |
+| `minSpeed`      | %    | none       | Lowest duty the fan reliably runs at. Duties between 0 and this are never sent. From standstill the fan starts only once the target reaches `minSpeed`, and then jumps straight to it. A running fan stays at `minSpeed` until the target is 0. Background: the EC only kick-starts the fan when leaving 0 %, so a ramp through 1–9 % leaves it stalled until a much higher duty. |
 | `sensors`       | list | all        | EC sensor indices whose maximum drives the curve, e.g. `[0, 1, 3]`. Indices are those shown by `fw-fanctrl probe` and `framework_tool --thermalget`. |
 
 A strategy without these keys behaves exactly like upstream. Example (also shipped as
@@ -118,7 +119,9 @@ and comes closer to stress-ng, compilers and games. The calibration therefore er
 warm side. A running service is paused for the duration and resumed afterwards. The phases:
 
 1. **Sensors:** Reads the EC sensor names and thermal thresholds.
-2. **Fan sweep:** Maps duty to RPM and finds the duty that starts the fan from standstill.
+2. **Fan:** Measures the duty that starts the fan, jumping from 0 % with the fan at rest
+   each time (the EC only kick-starts it when leaving 0 %), and the lowest duty a running fan
+   keeps turning at. The higher of the two becomes `minSpeed`. Then it maps duty to RPM.
 3. **Idle baseline:** Records every sensor while the machine is idle.
 4. **Load step:** Classifies the sensors. *Board* sensors react slowly and drive the curve.
    *Spiky* sensors (the CPU package) and sensors the EC itself ignores for fan control are
