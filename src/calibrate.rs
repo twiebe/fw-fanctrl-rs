@@ -47,6 +47,18 @@ impl Prefer {
             _ => None,
         }
     }
+    /// Share of the full-fan reference frequency a fan speed must reach: the
+    /// trade-off between noise and performance. Real CPU throttling (kernel
+    /// counters) is never accepted.
+    pub fn min_performance(self) -> f64 {
+        match self {
+            // MacBook-like: accept a platform power limit on a warm machine
+            Prefer::Quiet => 0.85,
+            Prefer::Balanced => 0.92,
+            Prefer::Cool => 0.97,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Prefer::Quiet => "quiet",
@@ -174,14 +186,13 @@ impl Equilibrium {
         }
     }
 
-    /// The CPU is not thermally limited at this duty.
-    ///
-    /// The decisive signal is performance: thermal limiting costs frequency, so the
-    /// CPU must reach at least 95 % of the frequency it achieves at 100 % fan under
-    /// the same load. Kernel throttle counters veto on top (they only advance at
-    /// episode boundaries, so they cannot prove the absence of throttling). Without
-    /// a frequency reading, a package near TjMax below PL1 counts as limited.
-    pub fn ok(&self) -> bool {
+    /// This duty is acceptable: no real CPU throttling, and at least `min_rel` of
+    /// the frequency reached at 100 % fan under the same load (lost performance can
+    /// also come from a platform power limit that thermald lowers on a warm
+    /// machine). Kernel throttle counters veto (they only advance at episode
+    /// boundaries, so they cannot prove the absence of throttling). Without a
+    /// frequency reading, a package near TjMax below PL1 counts as limited.
+    pub fn ok_for(&self, min_rel: f64) -> bool {
         if self.guard_hit {
             return false;
         }
@@ -191,7 +202,7 @@ impl Equilibrium {
             return false;
         }
         match self.relative_mhz() {
-            Some(rel) => rel >= 0.95,
+            Some(rel) => rel >= min_rel,
             None => {
                 let hot = self.spiky_max.is_some_and(|t| t >= 90.0);
                 !(hot && !self.power_limited())
@@ -217,13 +228,14 @@ pub struct CurveInput {
 /// anchor (quietest throttle-free duty at its settled board temperature), then up to
 /// 100 % at the EC's own fan_max for the dominant sensor.
 pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
-    let (on_offset, factor, up, down, delay) = match prefer {
-        Prefer::Quiet => (4.0, 1.0, 0.5, 0.2, 30),
-        Prefer::Balanced => (3.0, 1.3, 1.0, 0.3, 20),
-        Prefer::Cool => (2.0, 1.7, 2.0, 0.5, 10),
+    // The anchor itself already reflects `prefer` (performance threshold).
+    let (on_offset, up, down, delay) = match prefer {
+        Prefer::Quiet => (4.0, 0.5, 0.2, 30),
+        Prefer::Balanced => (3.0, 1.0, 0.3, 20),
+        Prefer::Cool => (2.0, 2.0, 0.5, 10),
     };
     let floor = c.min_speed.clamp(5, 40);
-    let anchor_duty = ((c.anchor.duty as f64 * factor).round() as u8).clamp(floor + 1, 100);
+    let anchor_duty = c.anchor.duty.clamp(floor + 1, 100);
     let anchor_t = c.anchor.board_temp.floor();
     let idle = c.idle_temp.round();
 
@@ -447,6 +459,7 @@ struct CpuSample {
     throttle_count: Option<u64>,
     energy_uj: Option<u64>,
     mhz: Option<f64>,
+    pl1_w: Option<f64>,
 }
 
 impl CpuSample {
@@ -457,6 +470,7 @@ impl CpuSample {
             throttle_count: read_u64(&format!("{THROTTLE_DIR}/package_throttle_count")),
             energy_uj: read_u64(&format!("{RAPL_DIR}/energy_uj")),
             mhz: avg_mhz(),
+            pl1_w: pl1_watts(),
         }
     }
 }
@@ -643,14 +657,25 @@ fn stable_rpm(ec: &CrosEc, sampler: &Sampler) -> Result<u16> {
 }
 
 /// First (quietest) result that is fine against `ref_mhz`.
-pub fn pick_anchor(results: &[Equilibrium], ref_mhz: Option<f64>) -> Option<Equilibrium> {
+pub fn pick_anchor(
+    results: &[Equilibrium],
+    ref_mhz: Option<f64>,
+    min_rel: f64,
+) -> Option<Equilibrium> {
     results
         .iter()
         .map(|e| Equilibrium {
             ref_mhz,
             ..e.clone()
         })
-        .find(Equilibrium::ok)
+        .find(|e| e.ok_for(min_rel))
+}
+
+fn max_opt(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 struct Groups<'a> {
@@ -716,7 +741,8 @@ fn hold(
         throttle_ms: delta(first.throttle_ms, last_s.throttle_ms),
         throttle_events: delta(first.throttle_count, last_s.throttle_count),
         package_w: watts(&w20[0], &w20[w20.len() - 1]),
-        pl1_w: pl1_watts(),
+        // lowest limit in the window: thermald may lower it while it gets warm
+        pl1_w: w20.iter().filter_map(|c| c.pl1_w).reduce(f64::min),
         mhz: (!mhz.is_empty()).then(|| mean(&mhz)),
         ref_mhz,
         guard_hit,
@@ -724,12 +750,24 @@ fn hold(
     })
 }
 
-fn report(label: &str, eq: &Equilibrium) {
+/// `pl1_max`: highest PL1 seen so far, to show when the platform lowered it.
+fn report(label: &str, eq: &Equilibrium, min_rel: f64, pl1_max: Option<f64>) {
     let na = || "n/a".to_string();
-    let verdict = if label.is_empty() {
-        if eq.ok() { "ok" } else { "thermally limited" }
+    let throttling =
+        eq.throttle_ms.is_some_and(|ms| ms > 600) || eq.throttle_events.is_some_and(|n| n > 0);
+    let verdict = if !label.is_empty() {
+        label.to_string()
+    } else if eq.ok_for(min_rel) {
+        "ok".into()
+    } else if throttling {
+        "CPU throttling".into()
     } else {
-        label
+        format!("below {:.0} % performance", min_rel * 100.0)
+    };
+    let pl1 = match (eq.pl1_w, pl1_max) {
+        (Some(p), Some(m)) if p + 0.5 < m => format!("{p:.0} W (lowered from {m:.0} W)"),
+        (Some(p), _) => format!("{p:.0} W"),
+        _ => na(),
     };
     eprintln!(
         "  {:>3}% ({} RPM): board {:.1}°C (sensor {}, {}), package {}, {} ({}), throttled {} ms/60 s ({} events), {} of PL1 {} → {}",
@@ -745,11 +783,11 @@ fn report(label: &str, eq: &Equilibrium) {
         eq.throttle_ms.map_or_else(na, |n| n.to_string()),
         eq.throttle_events.map_or_else(na, |n| n.to_string()),
         eq.package_w.map_or_else(na, |w| format!("{w:.1} W")),
-        eq.pl1_w.map_or_else(na, |w| format!("{w:.0} W")),
+        pl1,
         verdict
     );
-    if label == "reference" && !eq.ok() {
-        eprintln!("  note: the CPU is thermally limited even at full fan speed");
+    if label.starts_with("reference") && throttling {
+        eprintln!("  note: the CPU throttles even at full fan speed");
     }
 }
 
@@ -1020,9 +1058,16 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
         board: &board,
         spiky: &spiky,
     };
+    let min_rel = opts.prefer.min_performance();
+    eprintln!(
+        "  prefer {}: a fan speed must reach {:.0} % of the full-fan performance without CPU throttling",
+        opts.prefer.name(),
+        min_rel * 100.0
+    );
     let mut reference = hold(ec, &sampler, &groups, 100, None)?;
     reference.ref_mhz = reference.mhz;
-    report("reference", &reference);
+    let mut pl1_max = reference.pl1_w;
+    report("reference", &reference, min_rel, pl1_max);
     let mut duties: Vec<u8> = vec![min_speed, 20, 30, 40, 55, 65, 75, 85];
     duties.retain(|d| *d >= min_speed && *d < 100);
     duties.sort_unstable();
@@ -1031,8 +1076,9 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
     let mut anchor = None;
     for duty in duties {
         let eq = hold(ec, &sampler, &groups, duty, reference.mhz)?;
-        report("", &eq);
-        let ok = eq.ok();
+        pl1_max = max_opt(pl1_max, eq.pl1_w);
+        report("", &eq, min_rel, pl1_max);
+        let ok = eq.ok_for(min_rel);
         results.push(eq);
         if ok {
             anchor = results.last().cloned();
@@ -1048,18 +1094,19 @@ fn measure(ec: &CrosEc, opts: &Options, service_paused: bool) -> Result<()> {
             // against this fair one.
             let mut end = hold(ec, &sampler, &groups, 100, None)?;
             end.ref_mhz = end.mhz;
-            report("reference (end)", &end);
-            match pick_anchor(&results, end.mhz) {
+            pl1_max = max_opt(pl1_max, end.pl1_w);
+            report("reference (end)", &end, min_rel, pl1_max);
+            match pick_anchor(&results, end.mhz, min_rel) {
                 Some(a) => {
                     eprintln!(
-                        "  judged against the end reference: {}% is the quietest speed without loss",
+                        "  judged against the end reference: {}% is the quietest acceptable speed",
                         a.duty
                     );
                     a
                 }
                 None => {
                     eprintln!(
-                        "  note: only full fan speed avoids losing performance; the curve tops out there"
+                        "  note: only full fan speed reaches the required performance; the curve tops out there"
                     );
                     end
                 }
@@ -1243,15 +1290,39 @@ mod tests {
     }
 
     #[test]
-    fn prefer_shifts_curve_up() {
+    fn prefer_shifts_fan_on_point_and_ramps() {
         let q = build_strategy(&input(), Prefer::Quiet);
         let c = build_strategy(&input(), Prefer::Cool);
-        let anchor = |v: &Value| v["speedCurve"][3]["speed"].as_u64().unwrap();
-        assert!(anchor(&c) > anchor(&build_strategy(&input(), Prefer::Balanced)));
-        assert!(anchor(&build_strategy(&input(), Prefer::Balanced)) > anchor(&q));
+        // same measured anchor: prefer acted on the measurement already
+        assert_eq!(q["speedCurve"][3], c["speedCurve"][3]);
+        assert!(c["speedCurve"][1]["temp"].as_f64() < q["speedCurve"][1]["temp"].as_f64());
         assert!(c["rampUpRate"].as_f64() > q["rampUpRate"].as_f64());
         Config::parse(&json!({"defaultStrategy": "x", "strategies": {"x": c}}).to_string())
             .unwrap();
+    }
+
+    #[test]
+    fn prefer_picks_anchor_by_performance() {
+        // third calibration run on the Framework 13 Pro (thermald lowering PL1 33 → 30 W)
+        let step = |duty, mhz, throttle_ms| Equilibrium {
+            mhz: Some(mhz),
+            ref_mhz: Some(2632.0),
+            throttle_ms: Some(throttle_ms),
+            ..eq(duty, 70.0)
+        };
+        let results = [
+            step(10, 2165.0, 31_501),
+            step(20, 2321.0, 49_001),
+            step(30, 2356.0, 32_245),
+            step(40, 2405.0, 0),
+            step(55, 2435.0, 0),
+            step(75, 2465.0, 0),
+        ];
+        let pick =
+            |p: Prefer| pick_anchor(&results, Some(2632.0), p.min_performance()).map(|e| e.duty);
+        assert_eq!(pick(Prefer::Quiet), Some(40));
+        assert_eq!(pick(Prefer::Balanced), Some(55));
+        assert_eq!(pick(Prefer::Cool), None); // only full fan
     }
 
     #[test]
@@ -1270,30 +1341,30 @@ mod tests {
         // cool package, no counters moving
         let mut e = eq(30, 60.0);
         e.spiky_max = Some(85.0);
-        assert!(e.ok());
+        assert!(e.ok_for(0.95));
         // each signal on its own marks the duty as thermally limited
         let mut t = e.clone();
         t.throttle_ms = Some(601);
-        assert!(!t.ok());
+        assert!(!t.ok_for(0.95));
         let mut t = e.clone();
         t.throttle_events = Some(1);
-        assert!(!t.ok());
+        assert!(!t.ok_for(0.95));
         // the case from the Framework 13 Pro: counters static, package at 96 °C,
         // power below PL1 → held back by temperature
         let mut t = e.clone();
         t.spiky_max = Some(96.0);
-        assert!(!t.ok());
+        assert!(!t.ok_for(0.95));
         // same temperature at PL1: power-limited, more fan would not help
         t.package_w = Some(27.0);
-        assert!(t.ok());
+        assert!(t.ok_for(0.95));
         // no RAPL, no counters: near-TjMax counts as throttling
         let mut a = eq(30, 60.0);
         (a.throttle_ms, a.throttle_events, a.package_w, a.pl1_w) = (None, None, None, None);
-        assert!(!a.ok());
+        assert!(!a.ok_for(0.95));
         a.spiky_max = Some(89.0);
-        assert!(a.ok());
+        assert!(a.ok_for(0.95));
         a.guard_hit = true;
-        assert!(!a.ok());
+        assert!(!a.ok_for(0.95));
     }
 
     #[test]
@@ -1309,12 +1380,12 @@ mod tests {
             ref_mhz: Some(3090.0),
             ..eq(duty, 61.0)
         };
-        assert!(run(20, 92.0, 25.6, 3005.0).ok()); // 97 % of reference (noise is ~±1.5 %)
-        assert!(run(30, 90.0, 25.3, 2997.0).ok());
-        assert!(!run(20, 99.0, 20.0, 2700.0).ok()); // lost 13 % → thermally limited
+        assert!(run(20, 92.0, 25.6, 3005.0).ok_for(0.95)); // 97 % of reference (noise is ~±1.5 %)
+        assert!(run(30, 90.0, 25.3, 2997.0).ok_for(0.95));
+        assert!(!run(20, 99.0, 20.0, 2700.0).ok_for(0.95)); // lost 13 % → thermally limited
         let mut t = run(20, 92.0, 25.6, 3005.0);
         t.throttle_events = Some(2); // counters still veto
-        assert!(!t.ok());
+        assert!(!t.ok_for(0.95));
     }
 
     #[test]
@@ -1328,14 +1399,14 @@ mod tests {
         };
         let mut results = vec![step(40, 2405.0), step(55, 2435.0), step(75, 2465.0)];
         results[0].throttle_ms = Some(0);
-        assert!(results.iter().all(|e| !e.ok()));
+        assert!(results.iter().all(|e| !e.ok_for(0.95)));
         // end reference just as slow → 40 % is fine
-        assert_eq!(pick_anchor(&results, Some(2470.0)).unwrap().duty, 40);
+        assert_eq!(pick_anchor(&results, Some(2470.0), 0.95).unwrap().duty, 40);
         // end reference fast again → still nothing
-        assert!(pick_anchor(&results, Some(2630.0)).is_none());
+        assert!(pick_anchor(&results, Some(2630.0), 0.95).is_none());
         // throttling still vetoes
         results[0].throttle_ms = Some(30_000);
-        assert_eq!(pick_anchor(&results, Some(2470.0)).unwrap().duty, 55);
+        assert_eq!(pick_anchor(&results, Some(2470.0), 0.95).unwrap().duty, 55);
     }
 
     #[test]

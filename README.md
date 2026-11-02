@@ -131,9 +131,12 @@ warm side. A running service is paused for the duration and resumed afterwards. 
    without any thermal limit. Then increasing fixed fan speeds, starting at the start duty,
    each until the board temperature settles. The first speed at which the CPU is not
    thermally limited is the anchor of the curve:
-   - **Performance decides:** The average frequency must reach at least 95 % of the
-     reference, because thermal limiting costs frequency. A hot package on its own proves
-     nothing: a CPU at 92 °C running the same clocks as at full fan is not held back.
+   - **Performance decides:** The average frequency must reach a share of the reference
+     that `--prefer` sets (see the table below). Performance can be lost in two ways. The
+     CPU throttles itself, or the platform lowers the power limit on a warm machine (e.g.
+     thermald, which lowered PL1 from 33 to 30 W on the Framework 13 Pro). A hot package on
+     its own proves nothing: a CPU at 92 °C running the same clocks as at full fan is not
+     held back.
    - **Kernel counters can veto:** More than 1 % throttle time in the last 60 s
      (`package_throttle_total_time_ms`) or new `package_throttle_count` events mark the
      speed as limited. They cannot prove the *absence* of throttling, because both only
@@ -144,8 +147,9 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      passes against the end reference becomes the anchor.
    - **Settled or capped:** Each step shows whether the board temperature settled or the
      step stopped at its 4-minute cap.
-   - **PL1:** The effective PL1 is the lower of the MSR and the MMIO RAPL limit. Firmware and
-     DPTF often lower only the MMIO one.
+   - **PL1:** The effective PL1 is the lower of the MSR and the MMIO RAPL limit, read every
+     second. Firmware, DPTF and thermald often lower only the MMIO one. A step shows
+     "lowered from … W" when the limit dropped below the highest value seen.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
 6. **Idle comfort** (only with `--comfort-temp C`): Without load, the fan first cools the
@@ -158,11 +162,16 @@ The generated strategy is off until a few degrees above idle (or around the comf
 temperature), rises gently to the anchor and reaches 100 % at the EC's own `fan_max` for the
 dominant sensor. `--prefer` shifts it:
 
-| `--prefer` | Anchor duty | Fan starts at (without `--comfort-temp`) | Ramps (up / down / delay) |
-|------------|-------------|---------------|---------------------------|
-| `quiet` (default) | quietest duty without thermal limiting | idle + 4 °C | 0.5 / 0.2 %/s, 30 s |
-| `balanced` | × 1.3 | idle + 3 °C | 1.0 / 0.3 %/s, 20 s |
-| `cool` | × 1.7 | idle + 2 °C | 2.0 / 0.5 %/s, 10 s |
+`--prefer` sets the trade-off between noise and performance. The anchor is the quietest fan
+speed that reaches this share of the full-fan performance, and real CPU throttling is never
+accepted. `quiet` is MacBook-like: it accepts that the platform lowers the power limit on a
+warm machine instead of spinning the fan up.
+
+| `--prefer` | Required performance | Fan starts at (without `--comfort-temp`) | Ramps (up / down / delay) | Framework 13 Pro example |
+|------------|----------------------|---------------|---------------------------|-----|
+| `quiet` (default) | 85 % | idle + 4 °C | 0.5 / 0.2 %/s, 30 s | 40 % (3700 RPM) |
+| `balanced` | 92 % | idle + 3 °C | 1.0 / 0.3 %/s, 20 s | 55 % (4700 RPM) |
+| `cool` | 97 % | idle + 2 °C | 2.0 / 0.5 %/s, 10 s | 100 % |
 
 The strategy is always printed as JSON. `--apply NAME` additionally stores it as strategy
 `NAME` in the configuration. The config is validated first, the previous file is kept as
