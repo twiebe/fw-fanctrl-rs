@@ -1,0 +1,19 @@
+[package]
+name = "fw-fanctrl"
+version = "0.1.0"
+edition = "2024"
+description = "Drop-in Rust reimplementation of fw-fanctrl with smooth (staggered) fan ramping"
+license = "BSD-3-Clause"
+
+[dependencies]
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+shlex = "2.0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

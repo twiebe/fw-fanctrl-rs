@@ -1,0 +1,15 @@
+[Unit]
+Description=Framework Fan Controller sleep hook (fw-fanctrl-rs)
+Before=sleep.target
+StopWhenUnneeded=yes
+Requires=fw-fanctrl.service
+After=fw-fanctrl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=@BINDIR@/fw-fanctrl pause
+ExecStop=@BINDIR@/fw-fanctrl resume
+
+[Install]
+WantedBy=sleep.target

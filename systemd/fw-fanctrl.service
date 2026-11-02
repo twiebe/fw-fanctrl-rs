@@ -1,0 +1,41 @@
+[Unit]
+Description=Framework Fan Controller (fw-fanctrl-rs)
+Documentation=https://github.com/TamtamHero/fw-fanctrl
+
+[Service]
+Type=notify
+ExecStart=@BINDIR@/fw-fanctrl --output-format JSON run --config /etc/fw-fanctrl/config.json --silent
+ExecReload=/bin/kill -HUP $MAINPID
+# Runs after every stop, including crashes and watchdog kills.
+ExecStopPost=@BINDIR@/fw-fanctrl restore-auto
+Restart=always
+RestartSec=2
+WatchdogSec=15
+
+# Hardening: the service only needs /dev/cros_ec, its config and its socket.
+ConfigurationDirectory=fw-fanctrl
+RuntimeDirectory=fw-fanctrl
+DevicePolicy=closed
+DeviceAllow=/dev/cros_ec rw
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
