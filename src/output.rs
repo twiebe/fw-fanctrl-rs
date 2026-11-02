@@ -16,6 +16,8 @@ pub struct Status {
     pub default: bool,
     pub speed: u8,
     pub target_speed: u8,
+    /// Comfort controller output, if the strategy has `comfortTemp`.
+    pub comfort_speed: Option<u8>,
     pub temperature: f64,
     pub moving_average_temperature: f64,
     pub effective_temperature: f64,
@@ -149,6 +151,9 @@ impl Reply {
                     py_float(s.effective_temperature),
                     py_bool(s.active),
                 );
+                if let Some(c) = s.comfort_speed {
+                    out += &format!("ComfortSpeed: {c}%{nl}");
+                }
                 if s.failsafe {
                     out += &format!("Failsafe: True (EC automatic control){nl}");
                 }
@@ -225,6 +230,7 @@ impl Reply {
                 "active": s.active,
                 "configuration": {"path": s.config_path, "data": s.config},
                 "targetSpeed": s.target_speed,
+                "comfortSpeed": s.comfort_speed,
                 "failsafe": s.failsafe,
                 "fanRpm": s.fan_rpm,
                 "sensorTemperatures": s.sensors,

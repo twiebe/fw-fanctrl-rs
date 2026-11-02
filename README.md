@@ -27,6 +27,8 @@ Each strategy may additionally define:
 | `rampDownDelay` | s    | `0`        | How long the target has to stay below the current speed before the fan starts slowing down. Short load drops are ignored. |
 | `criticalTemp`  | °C   | none       | At or above this *raw* temperature (of the selected sensors), averaging and ramp-up limiting are bypassed and the fan goes straight to the curve value. |
 | `minSpeed`      | %    | none       | Lowest duty the fan reliably runs at. Duties between 0 and this are never sent. From standstill the fan starts only once the target reaches `minSpeed`, and then jumps straight to it. A running fan stays at `minSpeed` until the target is 0, and once off it stays off for at least 3 s. Background: the EC only kick-starts the fan when leaving 0 %, so a ramp through 1–9 % leaves it stalled until a much higher duty. |
+| `comfortTemp`   | °C   | none       | Idle / light-use target temperature (of the selected sensors). A slow integral controller adds as much fan as is needed to hold it, on top of the curve and never below it. See [Comfort temperature](#comfort-temperature). |
+| `comfortMaxSpeed` | %  | `30`       | Upper limit of the comfort controller. Needs `comfortTemp`. |
 | `sensors`       | list | all        | EC sensor indices whose maximum drives the curve, e.g. `[0, 1, 3]`. Indices are those shown by `fw-fanctrl probe` and `framework_tool --thermalget`. |
 
 A strategy without these keys behaves exactly like upstream. Example (also shipped as
@@ -50,6 +52,25 @@ the `smooth` strategy in the default config):
     "criticalTemp": 90
 }
 ```
+
+### Comfort temperature
+
+A fixed curve cannot know which fan speed holds a warm-but-idle machine at a pleasant
+surface temperature: that depends on the room, on whether it sits on a desk or a lap, on
+a dock or a closed lid. With `comfortTemp` this part is regulated at runtime instead:
+
+- Outside a ±0.5 °C deadband (the sensors report whole degrees), the comfort speed moves by
+  0.05 % per second and degree of error. It is slow on purpose: the board sensors react
+  with minutes of delay, and a hunting fan is more annoying than a steady one.
+- The fan target is the higher of the curve and the comfort speed. Under load the curve
+  takes over; while the curve asks for more, the comfort speed does not wind up, so it is
+  ready again as soon as the load ends.
+- It is limited to `comfortMaxSpeed` (default 30 %). `minSpeed`, the ramps, `criticalTemp`
+  and the emergency guard apply as usual.
+- `fw-fanctrl print` shows its current value as `ComfortSpeed`.
+
+Upstream fw-fanctrl does not know the key; the same strategy would run there as a plain
+curve.
 
 ### Choosing sensors
 
@@ -124,16 +145,16 @@ Calibration has two steps. **Measure once**, which takes a while and needs the h
 Then **apply** the result as often as you like, which is instant.
 
 ```sh
-sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH] [--comfort-only]
+sudo fw-fanctrl calibrate measure [--load-cmd CMD] [--output PATH]
 sudo fw-fanctrl calibrate apply [quiet|balanced|cool] [--comfort-temp C] [--name NAME] [--default] [--dry-run]
 fw-fanctrl use calibrated-balanced
 ```
 
 ### `calibrate measure`
 
-It takes about 45–60 minutes and puts all CPU cores under full load. The raw data is saved
+It takes about 30 minutes and puts all CPU cores under full load. The raw data is saved
 to `/etc/fw-fanctrl/calibration.json`, and a summary at the end shows the result for each
-preference and comfort temperature. The built-in
+preference. The built-in
 load uses 256-bit FMA when the CPU supports it, which draws more power than integer code
 and comes closer to stress-ng, compilers and games. The calibration therefore errs on the
 warm side. A running service is paused for the duration and resumed afterwards. The phases:
@@ -173,15 +194,9 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      "lowered from … W" when the limit dropped below the highest value seen.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
-6. **Idle comfort:** Without load, fixed fan speeds in descending order (30, 20, 15 %,
-   `minSpeed`, then off), each held until the board temperature settles (2–6 minutes). It
-   records the temperature each speed holds the board at. The fan-off step stops at 52 °C.
-   Fixed speeds are used on purpose: a controller that tries to hold a target temperature
-   needs much longer than a few minutes to find the real idle duty, and it overshoots
-   towards too much fan.
 
-`--comfort-only` redoes only phase 6 (no CPU load, up to 30 minutes) and updates the
-saved file in place. Everything else is kept.
+Idle comfort is not measured. It is regulated at runtime (`--comfort-temp`, see below),
+which also follows changes in ambient temperature and placement.
 
 ### `calibrate apply`
 
@@ -194,11 +209,10 @@ how old the measurement is.
 The generated strategy is off until a few degrees above idle, rises gently to the anchor and
 reaches 100 % at the EC's own `fan_max` for the dominant sensor. It also gets `minSpeed`.
 
-`--comfort-temp C` keeps the surface cool in idle and light use with as little fan as
-possible. The fan speed needed to hold the board at C °C is interpolated from the comfort
-measurement and becomes the fan-on point of the curve: off below C−2 °C, that speed at C °C.
-Fractions such as `41.5` work. Outside the measured range the nearest measured value is
-used, with a warning.
+`--comfort-temp C` sets `comfortTemp` (see [Comfort temperature](#comfort-temperature)):
+the board is held at about C °C in idle and light use with as little fan as possible. The
+curve then stays off up to C+2 °C and leaves that range to the comfort controller. C must
+be at least 6 °C below the anchor temperature.
 
 The preference (default `balanced`) sets the trade-off between noise and performance. The anchor is the quietest fan
 speed that reaches this share of the full-fan performance, and real CPU throttling is never

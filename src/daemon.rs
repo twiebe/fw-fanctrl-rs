@@ -318,6 +318,7 @@ impl Service {
             default: self.is_default(),
             speed: self.controller.output().unwrap_or(0),
             target_speed: self.last.target,
+            comfort_speed: self.last.comfort,
             temperature: self.last.temperature,
             moving_average_temperature: self.last.moving_average,
             effective_temperature: self.last.effective,

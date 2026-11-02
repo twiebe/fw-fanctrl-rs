@@ -9,6 +9,13 @@ const HISTORY_LEN: usize = 100;
 /// With `minSpeed`: once off, stay off at least this long. The EC only kick-starts
 /// the fan if it has seen 0 % for a moment; a quick off → on would leave it stalled.
 pub const MIN_OFF_SECS: f64 = 3.0;
+/// Comfort controller: integral gain in %/(°C·s). Slow on purpose: the board
+/// sensors lag by minutes, and a hunting fan is worse than a steady one.
+pub const COMFORT_KI: f64 = 0.05;
+/// No correction while the temperature is within this of the comfort target
+/// (sensors report whole degrees).
+pub const COMFORT_DEADBAND: f64 = 0.5;
+pub const COMFORT_MAX_SPEED: u8 = 30;
 
 pub fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
@@ -24,6 +31,8 @@ pub struct Tick {
     /// Speed to apply to the fan now.
     pub output: u8,
     pub critical: bool,
+    /// Output of the comfort controller, if the strategy has `comfortTemp`.
+    pub comfort: Option<u8>,
     /// A sensor reached its EC "high" threshold (minus margin): fan at 100 %.
     pub emergency: bool,
 }
@@ -33,6 +42,10 @@ pub struct Controller {
     history: VecDeque<f64>,
     timecount: u32,
     target: f64,
+    /// Curve part of `target` (re-evaluated every `fanSpeedUpdateFrequency` ticks).
+    curve_target: f64,
+    /// Comfort controller state (percent).
+    comfort: f64,
     output: Option<f64>,
     /// Seconds the target has been continuously below the output.
     below_for: f64,
@@ -52,6 +65,8 @@ impl Controller {
             history: VecDeque::from(vec![0.0; HISTORY_LEN]),
             timecount: 0,
             target: 0.0,
+            curve_target: 0.0,
+            comfort: 0.0,
             output: None,
             below_for: 0.0,
             off_for: MIN_OFF_SECS, // unknown history: allow an immediate start
@@ -96,13 +111,23 @@ impl Controller {
         let critical = emergency || s.ramp.critical_temp.is_some_and(|c| temp >= c);
 
         if emergency {
+            self.curve_target = 100.0;
             self.target = 100.0;
         } else if critical {
             // Emergency: follow the raw temperature, re-evaluated every tick.
-            self.target = s.target_speed(temp) as f64;
-        } else if self.timecount.is_multiple_of(s.fan_speed_update_frequency) {
-            self.target = s.target_speed(effective) as f64;
-            self.timecount = 0;
+            self.curve_target = s.target_speed(temp) as f64;
+            self.target = self.curve_target;
+        } else {
+            if self.timecount.is_multiple_of(s.fan_speed_update_frequency) {
+                self.curve_target = s.target_speed(effective) as f64;
+                self.timecount = 0;
+            }
+            self.target = self.curve_target;
+            if let Some(ct) = s.ramp.comfort_temp {
+                let max = s.ramp.comfort_max_speed.unwrap_or(COMFORT_MAX_SPEED) as f64;
+                self.comfort = comfort_step(self.comfort, avg, ct, max, self.curve_target, dt);
+                self.target = self.target.max(self.comfort.round());
+            }
         }
 
         let target = self.target;
@@ -163,9 +188,25 @@ impl Controller {
             target: target as u8,
             output: out.round() as u8,
             critical,
+            comfort: s.ramp.comfort_temp.map(|_| self.comfort.round() as u8),
             emergency,
         }
     }
+}
+
+/// One step of the comfort integral controller. Outside the deadband it moves by
+/// `COMFORT_KI` per degree of error and second. It does not wind up while the
+/// curve already asks for more (load), so it is ready right after the load ends.
+fn comfort_step(u: f64, temp: f64, target: f64, max: f64, curve: f64, dt: f64) -> f64 {
+    let err = temp - target;
+    if err.abs() <= COMFORT_DEADBAND {
+        return u;
+    }
+    let e = err - COMFORT_DEADBAND.copysign(err);
+    if e > 0.0 && curve > u {
+        return u;
+    }
+    (u + COMFORT_KI * e * dt).clamp(0.0, max)
 }
 
 /// Keep the output out of the band (0, min): from standstill only start once the
@@ -379,6 +420,65 @@ mod tests {
         );
         let mut c = Controller::new();
         assert_eq!(run(&mut c, &plain, &[40.0, 46.0, 46.0]), [0, 0, 1]);
+    }
+
+    fn comfort_strategy(off_until: f64, min_speed: Option<u8>) -> Strategy {
+        let mut s = strategy(
+            1,
+            1,
+            Ramp {
+                min_speed,
+                comfort_temp: Some(41.0),
+                ..Default::default()
+            },
+        );
+        s.speed_curve = vec![
+            CurvePoint {
+                temp: off_until,
+                speed: 0,
+            },
+            CurvePoint {
+                temp: 90.0,
+                speed: 100,
+            },
+        ];
+        s
+    }
+
+    #[test]
+    fn comfort_controller_adds_fan_slowly_and_backs_off() {
+        let s = comfort_strategy(50.0, Some(10));
+        let mut c = Controller::new();
+        // 43 °C: 1.5 °C beyond the deadband → +0.075 %/s; off until minSpeed
+        let out = run(&mut c, &s, &[43.0; 140]);
+        assert_eq!(out[100], 0);
+        assert_eq!(c.tick(&s, 43.0, 1.0, false).comfort, Some(11));
+        assert_eq!(*out.last().unwrap(), 10);
+        // within the deadband nothing moves
+        let held = run(&mut c, &s, &[41.4; 60]);
+        assert!(held.iter().all(|&o| o == 11));
+        // too cool: backs off by 0.025 %/s, then holds minSpeed until it reaches 0
+        let down = run(&mut c, &s, &[40.0; 600]);
+        assert_eq!(down[100], 10);
+        assert_eq!(*down.last().unwrap(), 0);
+        assert_eq!(c.tick(&s, 40.0, 1.0, false).comfort, Some(0));
+    }
+
+    #[test]
+    fn comfort_controller_does_not_wind_up_under_load_and_is_capped() {
+        let s = comfort_strategy(50.0, None);
+        let mut c = Controller::new();
+        run(&mut c, &s, &[43.0; 100]); // ~7.5 %
+        let before = c.tick(&s, 43.0, 1.0, false).comfort;
+        // load: the curve asks for far more, the controller stays put
+        let load = run(&mut c, &s, &[80.0; 300]);
+        assert_eq!(*load.last().unwrap(), 75);
+        assert_eq!(c.tick(&s, 80.0, 1.0, false).comfort, before);
+        // the curve does not cover it at all: capped at COMFORT_MAX_SPEED
+        let s = comfort_strategy(95.0, None);
+        let mut c = Controller::new();
+        let out = run(&mut c, &s, &[60.0; 1000]);
+        assert_eq!(*out.last().unwrap(), COMFORT_MAX_SPEED);
     }
 
     #[test]

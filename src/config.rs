@@ -35,6 +35,11 @@ pub struct Ramp {
     /// sent: starting jumps straight to it (the EC only kick-starts the fan when
     /// leaving 0 %), and a running fan stays at it until the target is 0.
     pub min_speed: Option<u8>,
+    /// Idle / light-use target temperature: a slow integral controller adds as
+    /// much fan as is needed to hold it (on top of the curve, never below it).
+    pub comfort_temp: Option<f64>,
+    /// Upper limit of the comfort controller (percent), default 30.
+    pub comfort_max_speed: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +114,8 @@ struct RawStrategy {
     critical_temp: Option<f64>,
     sensors: Option<Vec<u8>>,
     min_speed: Option<u8>,
+    comfort_temp: Option<f64>,
+    comfort_max_speed: Option<u8>,
 }
 
 /// EC memory map: 16 sensors in bank A plus 8 in bank B.
@@ -182,6 +189,15 @@ fn parse_strategy(name: &str, value: &Value) -> Result<Strategy> {
     if let Some(m) = raw.min_speed {
         check_range(name, "minSpeed", m as f64, 1.0, 50.0)?;
     }
+    if let Some(t) = raw.comfort_temp {
+        check_range(name, "comfortTemp", t, 25.0, 80.0)?;
+    }
+    if let Some(m) = raw.comfort_max_speed {
+        check_range(name, "comfortMaxSpeed", m as f64, 1.0, 100.0)?;
+        if raw.comfort_temp.is_none() {
+            bail!("strategy '{name}': comfortMaxSpeed needs comfortTemp");
+        }
+    }
     if let Some(sensors) = &raw.sensors {
         if sensors.is_empty() {
             bail!("strategy '{name}': sensors must not be empty (omit it to use all sensors)");
@@ -210,6 +226,8 @@ fn parse_strategy(name: &str, value: &Value) -> Result<Strategy> {
             down_delay,
             critical_temp: raw.critical_temp,
             min_speed: raw.min_speed,
+            comfort_temp: raw.comfort_temp,
+            comfort_max_speed: raw.comfort_max_speed,
         },
         sensors: raw.sensors,
     })

@@ -9,7 +9,9 @@
 //! 4. load step: which sensors react slowly (board) and which spike (CPU package)
 //! 5. sustained load: full-fan reference, then increasing fixed duties until even
 //!    the strictest preference is satisfied (or a second full-fan reference)
-//! 6. idle comfort: fan speed needed to hold the board at 40, 43 and 46 °C
+//!
+//! Idle comfort is not measured: a strategy's `comfortTemp` is held at runtime by
+//! a slow controller, which also follows ambient temperature and placement.
 //!
 //! The fan is always handed back to the EC afterwards (drop guard, signals, panic hook).
 
@@ -78,14 +80,13 @@ pub const CALIBRATION_PATH: &str = "/etc/fw-fanctrl/calibration.json";
 pub struct MeasureOptions {
     pub load_cmd: Option<String>,
     pub output: PathBuf,
-    /// Only redo the idle comfort phase and update `output` in place.
-    pub comfort_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApplyOptions {
     pub prefer: Prefer,
-    /// Keep the board sensors at about this temperature in idle / light use.
+    /// `comfortTemp` of the strategy: hold the board at about this temperature in
+    /// idle / light use.
     pub comfort_temp: Option<f64>,
     /// Strategy name; default `calibrated-<prefer>`.
     pub name: Option<String>,
@@ -116,9 +117,6 @@ pub struct Calibration {
     pub end_reference: Option<Equilibrium>,
     /// Increasing fixed duties under load, judged against `reference`.
     pub steps: Vec<Equilibrium>,
-    /// (board temperature °C, duty % that holds it in idle), ascending temperature,
-    /// descending duty.
-    pub comfort: Vec<(f64, u8)>,
 }
 
 // ---------------------------------------------------------------- analysis (pure)
@@ -263,13 +261,17 @@ pub struct CurveInput {
     /// EC thresholds of the dominant sensor.
     pub dominant_thresholds: Option<Thresholds>,
     pub sensors: Vec<usize>,
-    /// (temperature, duty that holds the board there in idle)
-    pub comfort: Option<(f64, u8)>,
+    /// `comfortTemp`: the curve leaves the range up to a few degrees above it to
+    /// the runtime comfort controller.
+    pub comfort: Option<f64>,
 }
 
 /// Build the strategy JSON. Shape: off until shortly above idle, gentle rise to the
 /// anchor (quietest throttle-free duty at its settled board temperature), then up to
 /// 100 % at the EC's own fan_max for the dominant sensor.
+/// With `comfortTemp`: the curve stays off up to this many degrees above it.
+const COMFORT_CURVE_GAP: f64 = 2.0;
+
 pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
     // The anchor itself already reflects `prefer` (performance threshold).
     let (on_offset, up, down, delay) = match prefer {
@@ -300,15 +302,15 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
     let mid_t = ((anchor_t + fan_max_t) / 2.0).round();
     let mid_speed = anchor_duty + (100 - anchor_duty) / 3;
 
-    // Fan-on: either just above idle, or around the comfort temperature, where the
-    // curve gives the duty that was measured to hold the board there.
-    let (off_t, on_t, on_speed) = match c.comfort {
-        Some((t, duty)) if t <= anchor_t - 3.0 => (t - 2.0, t, duty.max(floor).min(anchor_duty)),
-        _ => {
-            let off_t = (idle + on_offset).min(anchor_t - 4.0).max(1.0);
-            (off_t, (off_t + 2.0).min(anchor_t - 1.0), floor)
-        }
-    };
+    // Fan-on: just above idle, or with a comfort temperature a few degrees above
+    // it; below that the runtime comfort controller decides alone.
+    let off_t = match c.comfort {
+        Some(t) => t + COMFORT_CURVE_GAP,
+        None => idle + on_offset,
+    }
+    .min(anchor_t - 4.0)
+    .max(1.0);
+    let (on_t, on_speed) = ((off_t + 2.0).min(anchor_t - 1.0), floor);
 
     let candidates = [
         (0.0, 0),
@@ -326,7 +328,7 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
         }
     }
 
-    json!({
+    let mut out = json!({
         "fanSpeedUpdateFrequency": 2,
         "movingAverageInterval": 20,
         "sensors": c.sensors,
@@ -336,7 +338,11 @@ pub fn build_strategy(c: &CurveInput, prefer: Prefer) -> Value {
         "rampDownDelay": delay,
         "criticalTemp": critical,
         "minSpeed": floor,
-    })
+    });
+    if let Some(t) = c.comfort {
+        out["comfortTemp"] = json!(t);
+    }
+    out
 }
 
 /// Insert `strategy` as `name` into the config JSON and validate the result.
@@ -838,86 +844,6 @@ fn report(label: &str, eq: &Equilibrium, pl1_max: Option<f64>) {
     }
 }
 
-/// Highest board temperature the fan-off comfort step may reach before it is cut short.
-const COMFORT_MAX_TEMP: f64 = 52.0;
-
-/// Idle (no load): fixed, descending fan speeds, each held until the board
-/// temperature settles (2..6 min). Open loop on purpose: a controller needs far
-/// longer than a few minutes to find the true idle duty and overshoots towards
-/// too much fan. Returns (settled board temperature, duty), ascending temperature.
-fn measure_comfort(
-    ec: &CrosEc,
-    sampler: &Sampler,
-    board: &[usize],
-    min_speed: u8,
-) -> Result<Vec<(f64, u8)>> {
-    let mut duties = vec![30u8, 20, 15, min_speed];
-    duties.retain(|d| *d >= min_speed);
-    duties.sort_unstable_by(|a, b| b.cmp(a));
-    duties.dedup();
-    duties.push(0);
-    let mut out: Vec<(f64, u8)> = Vec::new();
-    for duty in duties {
-        if duty == 0 {
-            stop_fan(ec, sampler)?;
-        } else {
-            ec.send(EcCommand::SetFanDuty(duty))?;
-        }
-        let mut series = Vec::new();
-        let mut dominant = Vec::new();
-        let mut verdict = "capped at 6 min";
-        for s in 0..360 {
-            let (row, hit) = sampler.sample()?;
-            if let Some((t, i)) = max_of(&row, board) {
-                series.push(t);
-                dominant.push(i);
-                if duty == 0 && t >= COMFORT_MAX_TEMP {
-                    verdict = "too warm, stopped";
-                    break;
-                }
-            }
-            if hit {
-                verdict = "near an EC limit, stopped";
-                break;
-            }
-            if s >= 120 && settled(&series) {
-                verdict = "settled";
-                break;
-            }
-        }
-        if series.len() < 20 {
-            bail!("comfort phase: too few board readings");
-        }
-        let temp = mean(&series[series.len() - 20..]);
-        let sensor = dominant.last().copied().unwrap_or(board[0]);
-        eprintln!(
-            "  {duty:>3}% ({:>4} RPM): board {temp:.1}°C (sensor {sensor}, {verdict})",
-            rpm(ec)
-        );
-        if verdict != "settled" && duty == 0 {
-            // the fan-off temperature is unknown, only that it is above this
-            break;
-        }
-        out.push((temp, duty));
-    }
-    Ok(comfort_points(out))
-}
-
-/// Order (temperature, duty) points by temperature and keep only those where
-/// less fan means a warmer board, so interpolation is monotonic.
-pub fn comfort_points(mut pts: Vec<(f64, u8)>) -> Vec<(f64, u8)> {
-    // walk from most to least fan; each point must be warmer than the last kept one
-    pts.sort_by_key(|p| std::cmp::Reverse(p.1));
-    let mut out: Vec<(f64, u8)> = Vec::new();
-    for (t, d) in pts {
-        let t = (t * 10.0).round() / 10.0;
-        if out.last().is_none_or(|&(lt, ld)| t > lt && d < ld) {
-            out.push((t, d));
-        }
-    }
-    out
-}
-
 pub fn measure(opts: &MeasureOptions) -> Result<()> {
     if let Some(c) = &opts.load_cmd {
         split_load_cmd(c)?;
@@ -928,11 +854,6 @@ pub fn measure(opts: &MeasureOptions) -> Result<()> {
     {
         bail!("output directory {} does not exist", dir.display());
     }
-    let previous = if opts.comfort_only {
-        Some(load_calibration(&opts.output)?)
-    } else {
-        None
-    };
     let ec = CrosEc::open()?;
     signals::install();
     let service_paused = match pause_service() {
@@ -946,10 +867,7 @@ pub fn measure(opts: &MeasureOptions) -> Result<()> {
     if service_paused {
         eprintln!("fw-fanctrl service paused for the measurement (lease {LEASE_SECS} s, renewed)");
     }
-    let result = match previous {
-        Some(prev) => remeasure_comfort(&ec, prev, service_paused),
-        None => run_measurement(&ec, opts, service_paused),
-    };
+    let result = run_measurement(&ec, opts, service_paused);
     if service_paused {
         let _ = daemon::send_command(&["resume".to_string()]);
         eprintln!("fw-fanctrl service resumed");
@@ -971,7 +889,7 @@ fn run_measurement(
 ) -> Result<Calibration> {
     let mut guard = Guard { ec, load: None };
     let started = Instant::now();
-    let step = |n: u8, what: &str| eprintln!("\n[{n}/6] {what}");
+    let step = |n: u8, what: &str| eprintln!("\n[{n}/5] {what}");
     let on_ac = ec.on_ac().ok();
 
     // 1. sensors
@@ -1168,17 +1086,7 @@ fn run_measurement(
         report("reference (end)", &end, pl1_max);
         Some(end)
     };
-    if let Some(load) = guard.load.take() {
-        load.stop();
-    }
-
-    // 6. idle comfort
-    step(
-        6,
-        "idle comfort: board temperature at fixed fan speeds (up to 30 min)",
-    );
-    let comfort = measure_comfort(ec, &sampler, &board, min_speed)?;
-    drop(guard); // EC auto
+    drop(guard); // stop the load, EC auto
 
     let idle_temp = board
         .iter()
@@ -1202,27 +1110,7 @@ fn run_measurement(
         reference,
         end_reference,
         steps,
-        comfort,
     })
-}
-
-/// `calibrate measure --comfort-only`: keep everything else from `cal`.
-fn remeasure_comfort(
-    ec: &CrosEc,
-    mut cal: Calibration,
-    service_paused: bool,
-) -> Result<Calibration> {
-    let guard = Guard { ec, load: None };
-    let sampler = Sampler {
-        ec,
-        infos: &cal.sensors,
-        lease: service_paused.then(|| Cell::new(Instant::now())),
-    };
-    eprintln!("idle comfort: board temperature at fixed fan speeds (up to 30 min)");
-    let comfort = measure_comfort(ec, &sampler, &cal.board_sensors, cal.min_speed)?;
-    drop(guard); // EC auto
-    cal.comfort = comfort;
-    Ok(cal)
 }
 
 fn now_secs() -> u64 {
@@ -1249,49 +1137,18 @@ impl Calibration {
             })
     }
 
-    /// Duty that holds the board at `t` in idle, interpolated between the measured
-    /// targets. Outside the measured range the nearest point is used (and said so).
-    pub fn comfort_duty(&self, t: f64) -> Option<(u8, Option<String>)> {
-        let pts = &self.comfort;
-        let (first, last) = (pts.first()?, pts.last()?);
-        if t <= first.0 {
-            let note = (t < first.0).then(|| {
-                format!(
-                    "{t}°C is below the measured range; using {}% from {}°C (it may need more)",
-                    first.1, first.0
-                )
-            });
-            return Some((first.1, note));
-        }
-        if t >= last.0 {
-            let note = (t > last.0).then(|| {
-                format!(
-                    "{t}°C is above the measured range; using {}% from {}°C",
-                    last.1, last.0
-                )
-            });
-            return Some((last.1, note));
-        }
-        let w = pts.windows(2).find(|w| t >= w[0].0 && t <= w[1].0)?;
-        let (a, b) = (w[0], w[1]);
-        let duty = a.1 as f64 + (t - a.0) / (b.0 - a.0) * (b.1 as f64 - a.1 as f64);
-        Some((duty.round() as u8, None))
-    }
-
     pub fn curve_input(&self, prefer: Prefer, comfort_temp: Option<f64>) -> Result<CurveInput> {
         let anchor = self.anchor(prefer);
-        let comfort = match comfort_temp {
-            None => None,
-            Some(t) => match self.comfort_duty(t) {
-                Some((duty, note)) => {
-                    if let Some(n) = note {
-                        eprintln!("[Warning] > {n}");
-                    }
-                    Some((t, duty))
-                }
-                None => bail!("the calibration has no comfort measurements"),
-            },
-        };
+        if let Some(t) = comfort_temp {
+            let limit = anchor.board_temp.floor() - 4.0 - COMFORT_CURVE_GAP;
+            if t > limit {
+                bail!(
+                    "--comfort-temp {t} is too close to the anchor at {:.1}°C (at most {limit}°C)",
+                    anchor.board_temp
+                );
+            }
+        }
+        let comfort = comfort_temp;
         Ok(CurveInput {
             idle_temp: self.idle_temp,
             min_speed: self.min_speed,
@@ -1324,12 +1181,6 @@ fn print_summary(cal: &Calibration) {
             a.duty,
             rpm_at(a.duty),
             a.board_temp
-        );
-    }
-    for (t, d) in &cal.comfort {
-        eprintln!(
-            "  comfort: {d:>3}% fan (~{} RPM) holds {t}°C in idle",
-            rpm_at(*d)
         );
     }
 }
@@ -1405,7 +1256,7 @@ pub fn apply(opts: &ApplyOptions) -> Result<()> {
         input.anchor.board_temp,
         input
             .comfort
-            .map_or(String::new(), |(t, d)| format!(", comfort {t}°C → {d}%"))
+            .map_or(String::new(), |t| format!(", comfortTemp {t}°C"))
     );
     let strategy = build_strategy(&input, opts.prefer);
     println!("{}", serde_json::to_string_pretty(&strategy)?);
@@ -1681,25 +1532,28 @@ mod tests {
     #[test]
     fn comfort_moves_fan_on_point() {
         let mut i = input();
-        i.comfort = Some((40.0, 22));
-        let s = build_strategy(&i, Prefer::Quiet);
+        i.comfort = Some(41.5);
+        let s = build_strategy(&i, Prefer::Balanced);
+        assert_eq!(s["comfortTemp"], json!(41.5));
         let curve = &s["speedCurve"];
-        assert_eq!(curve[1], json!({"temp": 38.0, "speed": 0}));
-        assert_eq!(curve[2], json!({"temp": 40.0, "speed": 22}));
-        Config::parse(&json!({"defaultStrategy": "x", "strategies": {"x": s}}).to_string())
+        assert_eq!(curve[1], json!({"temp": 43.5, "speed": 0}));
+        assert_eq!(curve[2], json!({"temp": 45.5, "speed": 8}));
+        let c = Config::parse(&json!({"defaultStrategy": "x", "strategies": {"x": s}}).to_string())
             .unwrap();
-        // a duty below what starts the fan is raised to the floor
-        i.comfort = Some((40.0, 3));
-        assert_eq!(
-            build_strategy(&i, Prefer::Quiet)["speedCurve"][2]["speed"],
-            8
+        assert_eq!(c.strategy("x").unwrap().ramp.comfort_temp, Some(41.5));
+        assert!(
+            build_strategy(&input(), Prefer::Balanced)
+                .get("comfortTemp")
+                .is_none()
         );
-        // comfort too close to the anchor is ignored
-        i.comfort = Some((65.0, 25));
-        assert_eq!(
-            build_strategy(&i, Prefer::Quiet)["speedCurve"][1]["temp"],
-            44.0
-        );
+    }
+
+    #[test]
+    fn comfort_temp_must_stay_below_the_anchor() {
+        let cal = stored();
+        let anchor = cal.anchor(Prefer::Quiet).board_temp.floor();
+        assert!(cal.curve_input(Prefer::Quiet, Some(anchor - 6.0)).is_ok());
+        assert!(cal.curve_input(Prefer::Quiet, Some(anchor - 5.0)).is_err());
     }
 
     #[test]
@@ -1759,7 +1613,6 @@ mod tests {
                 step(75, 2465.0, 0, 65.9),
                 step(85, 2480.0, 0, 64.0),
             ],
-            comfort: vec![(40.0, 36), (43.0, 18), (46.0, 0)],
         }
     }
 
@@ -1771,50 +1624,6 @@ mod tests {
         assert_eq!(cal.anchor(Prefer::Quiet).duty, 40);
         assert_eq!(cal.anchor(Prefer::Balanced).duty, 55);
         assert_eq!(cal.anchor(Prefer::Cool).duty, 100); // end reference is still fast
-    }
-
-    #[test]
-    fn comfort_points_are_monotonic() {
-        // measured in descending duty order; a step that came out cooler than
-        // the one with more fan (noise, a cooling chassis) is dropped
-        let pts = comfort_points(vec![
-            (38.04, 30),
-            (39.1, 20),
-            (38.9, 15),
-            (40.33, 10),
-            (44.0, 0),
-        ]);
-        assert_eq!(pts, vec![(38.0, 30), (39.1, 20), (40.3, 10), (44.0, 0)]);
-        let cal = Calibration {
-            comfort: pts,
-            ..stored()
-        };
-        assert_eq!(cal.comfort_duty(41.0).unwrap().0, 8);
-        assert_eq!(cal.comfort_duty(40.3).unwrap().0, 10);
-    }
-
-    #[test]
-    fn fractional_comfort_temp() {
-        let mut i = input();
-        i.comfort = Some((41.5, 12));
-        let curve = &build_strategy(&i, Prefer::Balanced)["speedCurve"];
-        assert_eq!(curve[1], json!({"temp": 39.5, "speed": 0}));
-        assert_eq!(curve[2], json!({"temp": 41.5, "speed": 12}));
-    }
-
-    #[test]
-    fn comfort_interpolation() {
-        let cal = stored();
-        assert_eq!(cal.comfort_duty(40.0), Some((36, None)));
-        assert_eq!(cal.comfort_duty(41.5).unwrap().0, 27);
-        assert_eq!(cal.comfort_duty(44.5).unwrap().0, 9);
-        let (d, note) = cal.comfort_duty(38.0).unwrap();
-        assert_eq!(d, 36);
-        assert!(note.unwrap().contains("below the measured range"));
-        assert_eq!(cal.comfort_duty(50.0).unwrap().0, 0);
-        let mut none = stored();
-        none.comfort.clear();
-        assert!(none.curve_input(Prefer::Quiet, Some(43.0)).is_err());
     }
 
     #[test]
@@ -1846,7 +1655,8 @@ mod tests {
         let s = c.strategy("calibrated-quiet").unwrap();
         assert_eq!(s.ramp.min_speed, Some(10));
         assert_eq!(s.sensors, Some(vec![0, 1]));
-        assert_eq!(s.target_speed(43.0), 18); // comfort point
+        assert_eq!(s.ramp.comfort_temp, Some(43.0));
+        assert_eq!(s.target_speed(44.0), 0); // the comfort controller's range
         assert!(c.strategy("lazy").is_some());
         let backups = fs::read_dir(&dir)
             .unwrap()

@@ -157,6 +157,18 @@
                     },
                     "description": "fw-fanctrl-rs: EC temperature sensor indices (as shown by `fw-fanctrl probe` / `framework_tool --thermalget`) whose maximum drives the curve. Omit to use all sensors (upstream behaviour)."
                 },
+                "comfortTemp": {
+                    "type": "number",
+                    "minimum": 25,
+                    "maximum": 80,
+                    "description": "fw-fanctrl-rs: idle / light-use target temperature. A slow integral controller adds as much fan as is needed to hold it, on top of the curve and never below it."
+                },
+                "comfortMaxSpeed": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "fw-fanctrl-rs: upper limit (percent) of the comfort controller, default 30. Needs comfortTemp."
+                },
                 "minSpeed": {
                     "type": "integer",
                     "minimum": 1,
