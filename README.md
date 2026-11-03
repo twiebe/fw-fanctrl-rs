@@ -66,7 +66,9 @@ a dock or a closed lid. With `comfortTemp` this part is regulated at runtime ins
 - The fan target is the higher of the curve and the comfort speed. It only adds fan up to
   4 °C above `comfortTemp`. Above that (load) the curve alone is in charge. It never adds fan
   while the curve already asks for more or while the temperature is falling anyway, so it
-  does not wind up under load and is back at its idle value when the load ends.
+  does not wind up under load. While the temperature falls to or below `comfortTemp`
+  (after load), it backs off by 0.1 % per second even inside the deadband, so fan speed
+  that only light load needed does not linger.
 - It is limited to `comfortMaxSpeed` (default 30 %). `minSpeed`, the ramps, `criticalTemp`
   and the emergency guard apply as usual.
 - `fw-fanctrl print` shows its current value as `ComfortSpeed`.

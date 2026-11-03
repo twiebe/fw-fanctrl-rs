@@ -96,16 +96,16 @@ impl Controller {
         self.output.map(|o| o.round() as u8)
     }
 
-    /// The temperature dropped by more than 0.5 °C over the last minute
-    /// (mean of the last 15 readings vs. 45..60 s ago).
+    /// The temperature dropped by more than 0.5 °C within 80 s (mean of the last
+    /// 20 readings vs. 80..100 s ago): about 0.4 °C/min or faster.
     fn falling(&self) -> bool {
         let valid: Vec<f64> = self.history.iter().copied().filter(|t| *t > 0.0).collect();
         let n = valid.len();
-        if n < 60 {
+        if n < 100 {
             return false;
         }
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-        mean(&valid[n - 15..]) - mean(&valid[n - 60..n - 45]) < -0.5
+        mean(&valid[n - 20..]) - mean(&valid[n - 100..n - 80]) < -0.5
     }
 
     /// Mean of the last `interval` valid (> 0) readings, upstream semantics.
@@ -219,6 +219,8 @@ impl Controller {
 /// It never adds fan while the curve already asks for more, above the comfort
 /// zone (load: the curve's job), or while the temperature is falling anyway
 /// (after load), so it does not wind up and is at its idle value right after.
+/// While falling to or below the target it backs off even inside the deadband:
+/// what light load made necessary is not needed any more.
 fn comfort_step(
     u: f64,
     temp: f64,
@@ -229,6 +231,11 @@ fn comfort_step(
     dt: f64,
 ) -> f64 {
     let err = temp - target;
+    if falling && err <= COMFORT_DEADBAND {
+        // cooling down to the target or below: the extra fan was for a heat load
+        // that is gone, back off as if 1 °C too cool (also inside the deadband)
+        return (u - COMFORT_KI_DOWN * dt).max(0.0);
+    }
     if err.abs() <= COMFORT_DEADBAND {
         return u;
     }
@@ -488,12 +495,17 @@ mod tests {
         assert_eq!(out[100], 0);
         assert_eq!(c.tick(&s, 43.0, 1.0, false).comfort, Some(11));
         assert_eq!(*out.last().unwrap(), 10);
+        // slow approach (no "falling"): keeps adding while beyond the deadband
+        let approach: Vec<f64> = (0..300).map(|i| 43.0 - 1.6 * i as f64 / 300.0).collect();
+        run(&mut c, &s, &approach);
         // within the deadband nothing moves
         let held = run(&mut c, &s, &[41.4; 60]);
-        assert!(held.iter().all(|&o| o == 11));
-        // too cool: backs off by 0.05 %/s, then holds minSpeed until it reaches 0
-        let down = run(&mut c, &s, &[40.0; 300]);
-        assert_eq!(down[100], 10);
+        assert!(held.windows(2).all(|w| w[0] == w[1]), "{held:?}");
+        assert!(held[0] > 15, "{}", held[0]);
+        // a sudden drop counts as falling: backs off faster at first, then by
+        // 0.05 %/s, and holds minSpeed until it reaches 0
+        let down = run(&mut c, &s, &[40.0; 500]);
+        assert_eq!(down[150], 10);
         assert_eq!(*down.last().unwrap(), 0);
         assert_eq!(c.tick(&s, 40.0, 1.0, false).comfort, Some(0));
     }
@@ -526,6 +538,26 @@ mod tests {
         assert!(peak <= idle + 1, "comfort wound up to {peak} (idle {idle})");
         let after = run(&mut c, &s, &[41.0; 120]);
         assert!(*after.last().unwrap() <= idle + 1);
+    }
+
+    #[test]
+    fn comfort_controller_backs_off_after_light_load() {
+        // light load holds 44 °C (inside the zone, the curve is off): the
+        // controller rightly goes to its cap; then the load ends
+        let s = comfort_strategy(50.0, Some(10));
+        let mut c = Controller::new();
+        run(&mut c, &s, &[44.0; 1000]);
+        assert_eq!(c.tick(&s, 44.0, 1.0, false).comfort, Some(30));
+        let fall: Vec<f64> = (0..300).map(|i| 44.0 - 3.0 * i as f64 / 300.0).collect();
+        run(&mut c, &s, &fall);
+        // backed off a good part already while falling to the target
+        let at_target = c.tick(&s, 41.0, 1.0, false).comfort.unwrap();
+        assert!(at_target <= 25, "still at {at_target}% at the target");
+        // the remaining surplus keeps cooling the board below the target
+        run(&mut c, &s, &[41.0; 60]);
+        run(&mut c, &s, &[40.0; 300]);
+        let after = c.tick(&s, 40.0, 1.0, false).comfort.unwrap();
+        assert!(after <= 10, "still at {after}%");
     }
 
     #[test]
