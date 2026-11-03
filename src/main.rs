@@ -166,6 +166,14 @@ fn test_fan(percent: u8, seconds: u64) -> Result<()> {
     install_panic_failsafe();
     signals::install();
     println!("setting fan duty to {percent}% for {seconds}s (Ctrl-C restores EC control early)");
+    let limits: Vec<Option<f64>> = (0..ec.temperatures()?.len())
+        .map(|i| {
+            ec.thresholds(i as u8)
+                .ok()
+                .and_then(|t| t.high)
+                .map(f64::from)
+        })
+        .collect();
     let result = (|| -> Result<()> {
         ec.send(EcCommand::SetFanDuty(percent))?;
         let end = Instant::now() + Duration::from_secs(seconds);
@@ -176,6 +184,10 @@ fn test_fan(percent: u8, seconds: u64) -> Result<()> {
             }
             if Instant::now() >= next_print {
                 let temps = ec.temperatures().unwrap_or_default();
+                let current: Vec<Option<f64>> = temps.iter().map(|t| t.map(f64::from)).collect();
+                if daemon::near_limit(&current, &limits) {
+                    error::bail!("a sensor is near its EC limit, stopping the test");
+                }
                 println!(
                     "  fans: {:<20} max temp: {}",
                     fans_str(&ec.fans().unwrap_or_default()),

@@ -408,8 +408,8 @@ fn parse_test_fan(t: &mut Tokens) -> Result<Command> {
         t.next();
         let (opt, inline) = split_opt(tok);
         seconds = match t.value(opt, inline)?.parse::<u64>() {
-            Ok(v) if (1..=60).contains(&v) => v,
-            _ => bail!("--seconds must be between 1 and 60"),
+            Ok(v) if (1..=14_400).contains(&v) => v,
+            _ => bail!("--seconds must be between 1 and 14400"),
         };
     }
     Ok(Command::TestFan { percent, seconds })
@@ -566,6 +566,8 @@ mod tests {
         assert!(p("--output-format XML print", true).is_err());
         assert!(p("reset extra", true).is_err());
         assert!(p("test-fan 101", false).is_err());
+        assert!(p("test-fan 30 --seconds 14400", false).is_ok());
+        assert!(p("test-fan 30 --seconds 14401", false).is_err());
         assert_eq!(
             p("test-fan 30 --seconds 10", false).unwrap().command,
             Command::TestFan {

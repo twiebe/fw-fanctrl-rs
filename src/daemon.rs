@@ -477,7 +477,7 @@ impl Service {
 }
 
 /// Any sensor within `EMERGENCY_MARGIN` of its EC "high" threshold.
-fn near_limit(temps: &[Option<f64>], limits: &[Option<f64>]) -> bool {
+pub fn near_limit(temps: &[Option<f64>], limits: &[Option<f64>]) -> bool {
     temps
         .iter()
         .zip(limits)

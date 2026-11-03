@@ -105,6 +105,9 @@ pub struct Calibration {
     /// Unix time of the measurement.
     pub measured_at: u64,
     pub on_ac: Option<bool>,
+    /// Active power profile while measuring: it can change the power limits
+    /// (Framework 13 Pro: PL1 33 W on performance, 25 W on balanced).
+    pub power_profile: Option<String>,
     pub load_cmd: Option<String>,
     pub sensors: Vec<SensorInfo>,
     pub board_sensors: Vec<usize>,
@@ -891,6 +894,10 @@ fn run_measurement(
     let started = Instant::now();
     let step = |n: u8, what: &str| eprintln!("\n[{n}/5] {what}");
     let on_ac = ec.on_ac().ok();
+    let power_profile = power_profile();
+    if let Some(p) = &power_profile {
+        eprintln!("power profile: {p}");
+    }
 
     // 1. sensors
     step(1, "reading EC sensor information");
@@ -1101,6 +1108,7 @@ fn run_measurement(
         version: 1,
         measured_at: now_secs(),
         on_ac,
+        power_profile,
         load_cmd: opts.load_cmd.clone(),
         sensors: infos,
         board_sensors: board,
@@ -1111,6 +1119,30 @@ fn run_measurement(
         end_reference,
         steps,
     })
+}
+
+/// The tuned profile, or else the ACPI platform profile.
+fn power_profile() -> Option<String> {
+    [
+        "/etc/tuned/active_profile",
+        "/sys/firmware/acpi/platform_profile",
+    ]
+    .iter()
+    .filter_map(|p| fs::read_to_string(p).ok())
+    .map(|s| s.trim().to_string())
+    .find(|s| !s.is_empty())
+}
+
+/// Warning if the calibration was measured under another power profile than the
+/// active one. Unknown on either side: nothing to compare.
+fn profile_mismatch(measured: Option<&str>, active: Option<&str>) -> Option<String> {
+    match (measured, active) {
+        (Some(m), Some(a)) if m != a => Some(format!(
+            "the calibration was measured under power profile '{m}', now '{a}' is active; \
+             power limits and temperatures may differ"
+        )),
+        _ => None,
+    }
 }
 
 fn now_secs() -> u64 {
@@ -1247,6 +1279,9 @@ pub fn apply(opts: &ApplyOptions) -> Result<()> {
         eprintln!(
             "[Warning] > the calibration is old; consider measuring again (ambient temperature matters)"
         );
+    }
+    if let Some(w) = profile_mismatch(cal.power_profile.as_deref(), power_profile().as_deref()) {
+        eprintln!("[Warning] > {w}");
     }
     let input = cal.curve_input(opts.prefer, opts.comfort_temp)?;
     eprintln!(
@@ -1578,6 +1613,7 @@ mod tests {
             version: 1,
             measured_at: now_secs(),
             on_ac: Some(true),
+            power_profile: Some("balanced-bazzite".into()),
             load_cmd: None,
             sensors: vec![SensorInfo {
                 index: 1,
@@ -1624,6 +1660,19 @@ mod tests {
         assert_eq!(cal.anchor(Prefer::Quiet).duty, 40);
         assert_eq!(cal.anchor(Prefer::Balanced).duty, 55);
         assert_eq!(cal.anchor(Prefer::Cool).duty, 100); // end reference is still fast
+    }
+
+    #[test]
+    fn power_profile_mismatch_and_old_files() {
+        assert!(profile_mismatch(Some("a"), Some("b")).is_some());
+        assert!(profile_mismatch(Some("a"), Some("a")).is_none());
+        assert!(profile_mismatch(None, Some("b")).is_none());
+        assert!(profile_mismatch(Some("a"), None).is_none());
+        // calibration files from before the field still load
+        let mut v = serde_json::to_value(stored()).unwrap();
+        v.as_object_mut().unwrap().remove("powerProfile");
+        let cal: Calibration = serde_json::from_value(v).unwrap();
+        assert_eq!(cal.power_profile, None);
     }
 
     #[test]

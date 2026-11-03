@@ -136,7 +136,7 @@ The following extras run locally as root and do not talk to the service:
 | `run --dry-run` | Read the real sensors and run the full control loop, but never write to the EC. |
 | `run --simulate FILE` | No hardware at all. Temperatures are read from `FILE` (one value per sensor index, `-` for none, e.g. `38 45 - 36 72`), for testing the loop anywhere. |
 | `probe` | Print EC temperatures per sensor index, fan RPM and AC state. |
-| `test-fan <percent> [--seconds N]` | Set one duty for N seconds (default 5), then hand control back to the EC. |
+| `test-fan <percent> [--seconds N]` | Set one duty for N seconds (default 5, at most 4 hours), then hand control back to the EC, also early if a sensor gets near its EC limit. |
 | `restore-auto` | Hand fan control back to the EC. |
 | `calibrate measure` / `calibrate apply` | Measure this machine once and create strategies from it, see below. |
 
@@ -198,6 +198,11 @@ warm side. A running service is paused for the duration and resumed afterwards. 
      "lowered from … W" when the limit dropped below the highest value seen.
    - **Fallback without a frequency reading:** A package at 90 °C or more while drawing less
      than 90 % of RAPL PL1 counts as limited.
+
+The active power profile is saved with the data, and `apply` warns if another one is active.
+It matters: on the Framework 13 Pro the effective PL1 is 33 W on `throughput-performance-bazzite`
+and 25 W on `balanced-bazzite`, so calibrate under the profile you normally use.
+`scripts/profile-benchmark.sh` measures what two profiles differ by.
 
 Idle comfort is not measured. It is regulated at runtime (`--comfort-temp`, see below),
 which also follows changes in ambient temperature and placement.
