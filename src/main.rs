@@ -9,6 +9,7 @@ mod hw;
 mod output;
 mod signals;
 mod systemd;
+mod watch;
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -98,6 +99,7 @@ fn run_local(args: Args) -> Result<()> {
             let svc = daemon::Service::new(cfg, config, hw, strategy.as_deref());
             daemon::run(svc, args.output_format, silent)
         }
+        Command::Watch { interval } => watch::run(interval, args.output_format),
         Command::Probe => probe(args.output_format),
         Command::CalibrateMeasure(opts) => {
             install_panic_failsafe();

@@ -119,6 +119,7 @@ Added by fw-fanctrl-rs:
 ```
 fw-fanctrl set-default <strategy> [--discharging]
 fw-fanctrl set-default --discharging --clear
+fw-fanctrl print [all] --watch [--interval N]
 ```
 
 `set-default` makes a strategy the `defaultStrategy` (with `--discharging`: the
@@ -128,6 +129,23 @@ service switches at once. Like `set_config`, it is only accepted from root.
 
 `print all` additionally reports `TargetSpeed`, the fan RPM, the reading of every
 sensor and whether the fail-safe is active. `kill -HUP` (or `systemctl reload fw-fanctrl`) reloads the config.
+
+`print all --watch` (`-w`) repeats `print all` every `--interval` (`-n`, default 3) seconds
+until Ctrl-C, like `watch(1)`, and adds what the CPU is doing. With `--output-format JSON` it
+writes one document per line, with these values in a `throttling` object.
+
+| Line | Meaning |
+|------|---------|
+| `Throttled` | `YES, thermal` if the kernel's package throttle counters advanced in this interval or the package is at its temperature limit. `YES, power limit` if the package draws at least 90 % of PL1. Otherwise `no`, with the last limit seen during this watch. |
+| `ThermalThrottle` | Package throttle time and events during this watch and since boot. |
+| `CpuPackage` | Package temperature from `coretemp` and its limit. This is close to the EC's `peci-temp` and to what desktop monitors usually show as the CPU temperature. |
+| `CpuFrequency` | Average frequency over all CPUs. |
+| `PackagePower` | Average package power in this interval. Reading RAPL needs root, so run it with `sudo` to see this value and to detect the power limit. |
+| `PL1` | Effective long-term power limit (the lower of MSR and MMIO), and the highest value seen if it was lowered during this watch. |
+
+`no` is not proof: the kernel counters only advance when a throttle episode starts or ends,
+and without root a power limit goes unnoticed. The values come from sysfs on Intel, so on
+other CPUs most of them show `n/a`.
 
 The following extras run locally as root and do not talk to the service:
 

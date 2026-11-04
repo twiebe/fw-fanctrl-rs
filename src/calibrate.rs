@@ -219,7 +219,7 @@ pub struct Equilibrium {
 impl Equilibrium {
     /// The CPU is limited by its power budget, not by temperature.
     pub fn power_limited(&self) -> bool {
-        matches!((self.package_w, self.pl1_w), (Some(p), Some(l)) if l > 0.0 && p >= 0.9 * l)
+        matches!((self.package_w, self.pl1_w), (Some(p), Some(l)) if l > 0.0 && p >= POWER_LIMIT_SHARE * l)
     }
 
     /// Frequency relative to the reference run, if both are known.
@@ -494,25 +494,28 @@ fn burn_scalar(stop: &AtomicBool, seed: u64) {
     }
 }
 
-fn read_u64(path: &str) -> Option<u64> {
+pub(crate) fn read_u64(path: &str) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
+
+/// Package power from this share of PL1 on counts as running into the power limit.
+pub(crate) const POWER_LIMIT_SHARE: f64 = 0.9;
 
 const THROTTLE_DIR: &str = "/sys/devices/system/cpu/cpu0/thermal_throttle";
 const RAPL_DIR: &str = "/sys/class/powercap/intel-rapl:0";
 
 #[derive(Debug, Clone, Copy)]
-struct CpuSample {
-    at: Instant,
-    throttle_ms: Option<u64>,
-    throttle_count: Option<u64>,
-    energy_uj: Option<u64>,
-    mhz: Option<f64>,
-    pl1_w: Option<f64>,
+pub(crate) struct CpuSample {
+    pub(crate) at: Instant,
+    pub(crate) throttle_ms: Option<u64>,
+    pub(crate) throttle_count: Option<u64>,
+    pub(crate) energy_uj: Option<u64>,
+    pub(crate) mhz: Option<f64>,
+    pub(crate) pl1_w: Option<f64>,
 }
 
 impl CpuSample {
-    fn now() -> CpuSample {
+    pub(crate) fn now() -> CpuSample {
         CpuSample {
             at: Instant::now(),
             throttle_ms: read_u64(&format!("{THROTTLE_DIR}/package_throttle_total_time_ms")),
@@ -524,12 +527,12 @@ impl CpuSample {
     }
 }
 
-fn delta(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+pub(crate) fn delta(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     Some(b?.saturating_sub(a?))
 }
 
 /// Average package power between two samples (None on counter wrap or missing RAPL).
-fn watts(a: &CpuSample, b: &CpuSample) -> Option<f64> {
+pub(crate) fn watts(a: &CpuSample, b: &CpuSample) -> Option<f64> {
     let (ea, eb) = (a.energy_uj?, b.energy_uj?);
     let secs = b.at.duration_since(a.at).as_secs_f64();
     (eb >= ea && secs > 0.0).then(|| (eb - ea) as f64 / 1e6 / secs)

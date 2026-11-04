@@ -8,6 +8,8 @@ use crate::output::OutputFormat;
 
 pub use crate::config::DEFAULT_CONFIG_PATH;
 
+const DEFAULT_WATCH_INTERVAL: u64 = 3;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
     Ec,
@@ -42,6 +44,10 @@ pub enum Command {
     },
     Resume,
     Print(PrintSelection),
+    /// `print all --watch`: repeat `print all` every `interval` seconds.
+    Watch {
+        interval: u64,
+    },
     SetConfig(String),
     /// Set `defaultStrategy` (or `strategyOnDischarging`) in the configuration file.
     /// `strategy: None` (`--clear`) unsets `strategyOnDischarging`.
@@ -67,6 +73,7 @@ impl Command {
         matches!(
             self,
             Command::Run { .. }
+                | Command::Watch { .. }
                 | Command::CalibrateMeasure(_)
                 | Command::CalibrateApply(_)
                 | Command::Probe
@@ -99,6 +106,10 @@ commands:
   resume              resume the service
   print [all|active|current|list|speed]
                       print the selected information (default: all)
+  print [all] --watch [--interval N]
+                      repeat 'print all' every N seconds (default 3) until Ctrl-C and show
+                      whether the CPU is or was throttled; the package power needs root.
+                      -w and -n N are short forms, and --interval implies --watch
   set_config <json>   replace the service configuration with the provided one
   set-default <strategy> [--discharging]
                       make a strategy the default (or the one used on battery) and save
@@ -217,16 +228,7 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
             Command::Pause { lease }
         }
         "resume" => Command::Resume,
-        "print" => Command::Print(match t.next().unwrap_or("all") {
-            "all" => PrintSelection::All,
-            "active" => PrintSelection::Active,
-            "current" => PrintSelection::Current,
-            "list" => PrintSelection::List,
-            "speed" => PrintSelection::Speed,
-            v => bail!(
-                "argument print_selection: invalid choice: '{v}' (choose from 'all', 'active', 'current', 'list', 'speed')"
-            ),
-        }),
+        "print" => parse_print(&mut t, remote)?,
         "set_config" => match t.next() {
             Some(s) => Command::SetConfig(s.to_string()),
             None => bail!("the following arguments are required: provided_config"),
@@ -281,6 +283,54 @@ pub fn parse(argv: &[String], remote: bool) -> Result<Args> {
     Ok(Args {
         output_format,
         command,
+    })
+}
+
+fn parse_print(t: &mut Tokens, remote: bool) -> Result<Command> {
+    let mut selection = None;
+    let mut watch = false;
+    let mut interval = None;
+    while let Some(tok) = t.peek() {
+        if tok == "-h" || tok == "--help" {
+            break;
+        }
+        t.next();
+        let (opt, inline) = split_opt(tok);
+        match opt {
+            // the client does the repeating: never block the service with it
+            "--watch" | "-w" if !remote => watch = true,
+            "--interval" | "-n" if !remote => {
+                interval = match t.value(opt, inline)?.parse::<u64>() {
+                    Ok(v) if (1..=3600).contains(&v) => Some(v),
+                    _ => bail!("--interval must be between 1 and 3600 seconds"),
+                };
+                watch = true;
+            }
+            _ if opt.starts_with('-') => bail!("unrecognized arguments: {tok}"),
+            _ if selection.is_none() => {
+                selection = Some(match tok {
+                    "all" => PrintSelection::All,
+                    "active" => PrintSelection::Active,
+                    "current" => PrintSelection::Current,
+                    "list" => PrintSelection::List,
+                    "speed" => PrintSelection::Speed,
+                    v => bail!(
+                        "argument print_selection: invalid choice: '{v}' (choose from 'all', 'active', 'current', 'list', 'speed')"
+                    ),
+                });
+            }
+            _ => bail!("unrecognized arguments: {tok}"),
+        }
+    }
+    let selection = selection.unwrap_or(PrintSelection::All);
+    if !watch {
+        return Ok(Command::Print(selection));
+    }
+    if selection != PrintSelection::All {
+        bail!("--watch only works with 'print all'");
+    }
+    Ok(Command::Watch {
+        interval: interval.unwrap_or(DEFAULT_WATCH_INTERVAL),
     })
 }
 
@@ -500,8 +550,42 @@ mod tests {
     }
 
     #[test]
+    fn print_watch() {
+        let watch = |interval| Command::Watch { interval };
+        for (args, expected) in [
+            ("print --watch", watch(3)),
+            ("print all --watch", watch(3)),
+            ("print -w all", watch(3)),
+            ("print all --watch --interval 5", watch(5)),
+            ("print all --watch --interval=5", watch(5)),
+            ("print -w -n 1", watch(1)),
+            ("print all -n 10", watch(10)),
+        ] {
+            assert_eq!(p(args, false).unwrap().command, expected, "{args}");
+        }
+        for bad in [
+            "print speed --watch",
+            "print all --watch --interval 0",
+            "print all --watch --interval 3601",
+            "print all --watch --interval 1.5",
+            "print all --watch --interval",
+            "print all list",
+            "print --bogus",
+        ] {
+            assert!(p(bad, false).is_err(), "{bad}");
+        }
+        assert_eq!(
+            p("print speed", false).unwrap().command,
+            Command::Print(PrintSelection::Speed)
+        );
+        assert_eq!(p("print -h", false).unwrap().command, Command::Help);
+    }
+
+    #[test]
     fn remote_cannot_run_local_commands() {
         for c in [
+            "print --watch",
+            "print all -n 5",
             "run",
             "probe",
             "restore-auto",
