@@ -136,7 +136,7 @@ writes one document per line, with these values in a `throttling` object.
 
 | Line | Meaning |
 |------|---------|
-| `Throttled` | `YES, thermal` if the kernel's package throttle counters advanced in this interval or the package is at its temperature limit. `YES, power limit` if the package draws at least 90 % of PL1. Otherwise `no`, with the last limit seen during this watch. |
+| `Throttled` | `YES, thermal` if the kernel's package throttle counters advanced in this interval or the package is at its temperature limit. `YES, power limit` from 90 % of PL1 until the package draws less than 80 %. Otherwise `no`, with the last limit seen during this watch. |
 | `ThermalThrottle` | Package throttle time and events during this watch and since boot. |
 | `PowerLimitThrottle` | Time and episodes at the power limit during this watch, counted per interval by the watch itself, so the time is only as exact as `--interval`. Needs root. There is no value since boot, because the kernel only counts this with the `int_pln_enable` boot option. |
 | `CpuPackage` | Package temperature from `coretemp` and its limit. This is close to the EC's `peci-temp` and to what desktop monitors usually show as the CPU temperature. |

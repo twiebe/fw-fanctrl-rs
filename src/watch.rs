@@ -19,6 +19,9 @@ use crate::output::{OutputFormat, Reply, to_py_json};
 const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J";
 /// Time before the first frame, so that it can already show the package power.
 const FIRST_SAMPLE_DELAY: Duration = Duration::from_millis(250);
+/// Hysteresis: a power limit episode starts at `POWER_LIMIT_SHARE` of PL1 and only
+/// ends below this share, so power hovering around the threshold is one episode.
+const POWER_LIMIT_EXIT_SHARE: f64 = 0.8;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Limit {
@@ -150,7 +153,14 @@ impl Tracker {
         let at_limit = package.is_some_and(|p| p.limit.is_some_and(|l| p.temp >= l));
         let power_w = watts(&self.prev, &cur);
         let at_pl1 = match (power_w, cur.pl1_w) {
-            (Some(p), Some(l)) if l > 0.0 => Some(p >= POWER_LIMIT_SHARE * l),
+            (Some(p), Some(l)) if l > 0.0 => {
+                let share = if self.was_at_pl1 {
+                    POWER_LIMIT_EXIT_SHARE
+                } else {
+                    POWER_LIMIT_SHARE
+                };
+                Some(p >= share * l)
+            }
             _ => None,
         };
         let limit = if counters || at_limit {
@@ -464,6 +474,53 @@ mod tests {
         assert!(
             r.natural()
                 .contains("PowerLimitThrottle: 3000 ms, 2 events in this watch\n")
+        );
+    }
+
+    #[test]
+    fn power_limit_episode_has_hysteresis() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut t = Tracker::new(sample(t0, 0, 0, 0, 30.0));
+        let mut energy = 0;
+        let mut step = |i: u32, watts: u64| {
+            energy += watts;
+            t.update(sample(t0 + i * s, 0, 0, energy, 30.0), cool())
+        };
+        // 26 W = 87 %: not enough to start an episode
+        let r = step(1, 26);
+        assert_eq!(r.limit, None);
+        assert_eq!(r.power_limited, Some(PowerLimited::default()));
+        // 27 W = 90 % starts it, 25 W = 83 % keeps it
+        step(2, 27);
+        let r = step(3, 25);
+        assert_eq!(r.limit, Some(Limit::Power));
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 2000,
+                events: 1
+            })
+        );
+        // 23 W = 77 % ends it, 26 W does not start a new one, 27 W does
+        let r = step(4, 23);
+        assert_eq!(r.limit, None);
+        let r = step(5, 26);
+        assert_eq!(r.limit, None);
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 2000,
+                events: 1
+            })
+        );
+        let r = step(6, 27);
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 3000,
+                events: 2
+            })
         );
     }
 
