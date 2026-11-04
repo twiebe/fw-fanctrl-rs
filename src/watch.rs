@@ -101,6 +101,8 @@ struct Report {
     watch_events: Option<u64>,
     boot_ms: Option<u64>,
     boot_events: Option<u64>,
+    /// Time and episodes at the power limit during this watch (`None` = not measurable).
+    power_limited: Option<PowerLimited>,
     package: Option<PackageTemp>,
     mhz: Option<f64>,
     power_w: Option<f64>,
@@ -109,12 +111,22 @@ struct Report {
     pl1_lowered_from: Option<f64>,
 }
 
+/// Counted by the watch itself, one whole interval at a time: the kernel has no such
+/// counter by default (`package_power_limit_count` needs the `int_pln_enable` boot option).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PowerLimited {
+    ms: u64,
+    events: u64,
+}
+
 /// Compares consecutive samples.
 struct Tracker {
     start: CpuSample,
     prev: CpuSample,
     highest_pl1: Option<f64>,
     last: Option<(Limit, Instant)>,
+    power_limited: Option<PowerLimited>,
+    was_at_pl1: bool,
 }
 
 impl Tracker {
@@ -124,6 +136,8 @@ impl Tracker {
             prev: start,
             highest_pl1: start.pl1_w,
             last: None,
+            power_limited: None,
+            was_at_pl1: false,
         }
     }
 
@@ -135,17 +149,26 @@ impl Tracker {
         // at its limit is the only sign of an episode that is still going on.
         let at_limit = package.is_some_and(|p| p.limit.is_some_and(|l| p.temp >= l));
         let power_w = watts(&self.prev, &cur);
-        let at_pl1 = matches!(
-            (power_w, cur.pl1_w),
-            (Some(p), Some(l)) if l > 0.0 && p >= POWER_LIMIT_SHARE * l
-        );
+        let at_pl1 = match (power_w, cur.pl1_w) {
+            (Some(p), Some(l)) if l > 0.0 => Some(p >= POWER_LIMIT_SHARE * l),
+            _ => None,
+        };
         let limit = if counters || at_limit {
             Some(Limit::Thermal)
-        } else if at_pl1 {
+        } else if at_pl1 == Some(true) {
             Some(Limit::Power)
         } else {
             None
         };
+        // Independent of `limit`: both limits can apply in the same interval.
+        if let Some(limited) = at_pl1 {
+            let total = self.power_limited.get_or_insert_default();
+            if limited {
+                total.ms += cur.at.duration_since(self.prev.at).as_millis() as u64;
+                total.events += u64::from(!self.was_at_pl1);
+            }
+            self.was_at_pl1 = limited;
+        }
 
         self.highest_pl1 = match (self.highest_pl1, cur.pl1_w) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -161,6 +184,7 @@ impl Tracker {
             watch_events: delta(self.start.throttle_count, cur.throttle_count),
             boot_ms: cur.throttle_ms,
             boot_events: cur.throttle_count,
+            power_limited: self.power_limited,
             package,
             mhz: cur.mhz,
             power_w,
@@ -210,6 +234,9 @@ impl Report {
         } else {
             thermal
         };
+        let power_limited = self.power_limited.map_or("n/a".to_string(), |p| {
+            format!("{} ms, {} events in this watch", p.ms, p.events)
+        });
         let package = self.package.map_or("n/a".to_string(), |p| match p.limit {
             Some(l) => format!("{:.0}°C (limit {l:.0}°C)", p.temp),
             None => format!("{:.0}°C", p.temp),
@@ -229,7 +256,8 @@ impl Report {
             .pl1_lowered_from
             .map_or(String::new(), |h| format!(" (lowered from {h:.1} W)"));
         format!(
-            "Throttled: {throttled}\nThermalThrottle: {thermal}\nCpuPackage: {package}\n\
+            "Throttled: {throttled}\nThermalThrottle: {thermal}\n\
+             PowerLimitThrottle: {power_limited}\nCpuPackage: {package}\n\
              CpuFrequency: {mhz}\nPackagePower: {power}\nPL1: {pl1}{lowered}\n"
         )
     }
@@ -245,6 +273,8 @@ impl Report {
             "thermalWatchEvents": self.watch_events,
             "thermalBootMs": self.boot_ms,
             "thermalBootEvents": self.boot_events,
+            "powerLimitWatchMs": self.power_limited.map(|p| p.ms),
+            "powerLimitWatchEvents": self.power_limited.map(|p| p.events),
             "packageTemperature": self.package.map(|p| p.temp),
             "packageTemperatureLimit": self.package.and_then(|p| p.limit),
             "averageMhz": self.mhz,
@@ -396,8 +426,45 @@ mod tests {
         // 27 W = 90 % of PL1
         let r = t.update(sample(t0 + s, 0, 0, 27, 30.0), cool());
         assert_eq!(r.limit, Some(Limit::Power));
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 1000,
+                events: 1
+            })
+        );
+        // still the same episode, although thermal wins the verdict
         let r = t.update(sample(t0 + 2 * s, 100, 1, 54, 30.0), cool());
         assert_eq!(r.limit, Some(Limit::Thermal));
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 2000,
+                events: 1
+            })
+        );
+        // below the limit: nothing added
+        let r = t.update(sample(t0 + 3 * s, 100, 1, 64, 30.0), cool());
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 2000,
+                events: 1
+            })
+        );
+        // a new episode
+        let r = t.update(sample(t0 + 4 * s, 100, 1, 94, 30.0), cool());
+        assert_eq!(
+            r.power_limited,
+            Some(PowerLimited {
+                ms: 3000,
+                events: 2
+            })
+        );
+        assert!(
+            r.natural()
+                .contains("PowerLimitThrottle: 3000 ms, 2 events in this watch\n")
+        );
     }
 
     #[test]
@@ -416,7 +483,8 @@ mod tests {
         assert_eq!(r.limit, None);
         assert_eq!(
             r.natural(),
-            "Throttled: no\nThermalThrottle: n/a\nCpuPackage: n/a\nCpuFrequency: n/a\n\
+            "Throttled: no\nThermalThrottle: n/a\nPowerLimitThrottle: n/a\n\
+             CpuPackage: n/a\nCpuFrequency: n/a\n\
              PackagePower: n/a (RAPL not readable, try sudo)\nPL1: n/a\n"
         );
     }
